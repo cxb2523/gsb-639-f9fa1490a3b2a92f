@@ -1,0 +1,56 @@
+# 大文件 / 私有素材
+dic/
+files/
+img/
+
+# 生成产物与缓存
+web/data/
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 本地密钥
+.env
+.env.docker
+
+# 归档
+archive/
+
+# llm
+.claude/
+
+# docs
+docs/*
+
+# test
+tools/
+audio-check.html
+
+# Native builds (platform source projects are tracked)
+node_modules/
+mobile/www/
+web/mobile/
+android/.gradle/
+android/local.properties
+android/**/build/
+android/app/src/main/assets/public/
+android/app/src/main/assets/capacitor.config.json
+android/app/src/main/assets/capacitor.plugins.json
+android/capacitor-cordova-android-plugins/
+ios/App/App/public/
+ios/App/App/capacitor.config.json
+ios/App/Pods/
+ios/App/build/
+ios/App/build-simulator/
+ios/**/xcuserdata/
+*.keystore
+*.jks
+*.p12
+*.mobileprovision
+mobile-artifacts/
+dist/
+release-assets/
+
+.idea/
+design/

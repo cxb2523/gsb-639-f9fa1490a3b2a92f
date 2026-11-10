@@ -1,0 +1,175 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { execFileSync } from 'node:child_process';
+import { readFile, readdir } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { unzipSync } from 'fflate';
+import { parse } from 'yaml';
+import xcode from 'xcode';
+import { nativeBuildsFromSources, readNativeBuilds } from '../mobile/scripts/native-builds.mjs';
+import { NATIVE_REVISION } from '../mobile/src/update.js';
+
+const root = fileURLToPath(new URL('../', import.meta.url));
+const read = (path) => readFile(new URL('../' + path, import.meta.url));
+
+test('native build extraction tracks platform versions and rejects inconsistent release configurations', () => {
+  assert.deepEqual(nativeBuildsFromSources('versionCode 10\r\n', 'CURRENT_PROJECT_VERSION = 13;\r\nCURRENT_PROJECT_VERSION = 13;\r\n'),
+    { android: 10, ios: 13 });
+  assert.deepEqual(nativeBuildsFromSources('versionCode 11\n', 'CURRENT_PROJECT_VERSION = 14;\n'), { android: 11, ios: 14 });
+  for (const [android, ios] of [['', 'CURRENT_PROJECT_VERSION = 13;'], ['versionCode 10', ''],
+    ['versionCode 10', 'CURRENT_PROJECT_VERSION = 13;\nCURRENT_PROJECT_VERSION = 14;'],
+    ['versionCode 0', 'CURRENT_PROJECT_VERSION = 13;']]) {
+    assert.throws(() => nativeBuildsFromSources(android, ios), /Native build versions/);
+  }
+});
+
+test('Android system speech is registered and the installed TTS engine is visible', async () => {
+  assert.match((await read('android/app/src/main/java/app/linguatrack/mobile/MainActivity.java')).toString(), /registerPlugin\(SpeechAudioPlugin.class\)/);
+  assert.match((await read('android/app/src/main/AndroidManifest.xml')).toString(), /<queries>[\s\S]*android.intent.action.TTS_SERVICE[\s\S]*<\/queries>/);
+});
+
+test('native caption plugin is included in the iOS target and registered by the bridge', async () => {
+  const project = xcode.project(fileURLToPath(new URL('../ios/App/App.xcodeproj/project.pbxproj', import.meta.url)));
+  project.parseSync();
+  const phase = project.pbxSourcesBuildPhaseObj('504EC3031FED79650016851F');
+  assert.ok(phase.files.some((file) => file.comment === 'CaptionPipPlugin.swift in Sources'));
+  assert.ok(phase.files.some((file) => file.comment === 'AudioPlayerPlugin.swift in Sources'));
+  assert.ok(phase.files.some((file) => file.comment === 'SpeechAudioPlugin.swift in Sources'));
+  assert.ok(phase.files.some((file) => file.comment === 'SpeechPCM.swift in Sources'));
+  assert.ok(phase.files.some((file) => file.comment === 'DevelopmentCache.swift in Sources'));
+  assert.match((await read('ios/App/App/AppDelegate.swift')).toString(), /registerPluginInstance\(CaptionPipPlugin\(\)\)/);
+  assert.match((await read('ios/App/App/AppDelegate.swift')).toString(), /registerPluginInstance\(AudioPlayerPlugin\(\)\)/);
+  assert.match((await read('ios/App/App/AppDelegate.swift')).toString(), /registerPluginInstance\(SpeechAudioPlugin\(\)\)/);
+  const plugin = (await read('ios/App/App/CaptionPipPlugin.swift')).toString();
+  assert.match(plugin, /AVPictureInPictureVideoCallViewController/);
+  assert.doesNotMatch(plugin, /AVPlayerLayer|AVSampleBufferDisplayLayer|setValue\(|forKey:|NSSelectorFromString/);
+});
+
+test('iOS playback uses a valid shared audio category and retains the caption controller after normal stop', async () => {
+  const shell = (await read('ios/App/App/AppDelegate.swift')).toString();
+  const audio = (await read('ios/App/App/AudioPlayerPlugin.swift')).toString();
+  const captions = (await read('ios/App/App/CaptionPipPlugin.swift')).toString();
+  assert.match(shell, /setCategory\(\.playback, mode: \.default, options: \[\]\)/);
+  for (const source of [shell, audio, captions]) assert.doesNotMatch(source, /options:\s*\[\.allowAirPlay\]/);
+  assert.match(audio, /try PlaybackSession.activate\(\)/);
+  assert.match(captions, /try PlaybackSession.activate\(\)/);
+  assert.match(shell, /!audio.categoryOptions.isEmpty/);
+  const speech = (await read('ios/App/App/SpeechAudioPlugin.swift')).toString();
+  assert.match(speech, /usesApplicationAudioSession = true/);
+  assert.doesNotMatch(speech, /usesApplicationAudioSession = false/);
+  assert.match(audio, /audiovisualBackgroundPlaybackPolicy = \.continuesIfPossible/);
+  assert.match(audio, /mediaType == \.video \{ track.isEnabled = false/);
+  assert.match(captions, /pictureInPictureControllerDidStopPictureInPicture[\s\S]*?finish\(reuse: true\)/);
+  assert.match(captions, /if !reuse \|\| retiring \{/);
+});
+
+test('persisted iOS development snapshots are covered by native controller tests in the simulator workflow', async () => {
+  const project = xcode.project(fileURLToPath(new URL('../ios/App/App.xcodeproj/project.pbxproj', import.meta.url)));
+  project.parseSync();
+  const phase = project.pbxSourcesBuildPhaseObj('A20000000000000000000001');
+  assert.ok(phase.files.some((file) => file.comment === 'DevelopmentViewTests.swift in Sources'));
+  assert.ok(phase.files.some((file) => file.comment === 'PlaybackSessionTests.swift in Sources'));
+  const target = project.pbxNativeTargetSection().A20000000000000000000001;
+  const dependency = project.hash.project.objects.PBXTargetDependency[target.dependencies[0].value];
+  assert.equal(dependency.target, '504EC3031FED79650016851F');
+  const scheme = (await read('ios/App/App.xcodeproj/xcshareddata/xcschemes/DevelopmentViewTests.xcscheme')).toString();
+  assert.match(scheme, /BlueprintIdentifier="A20000000000000000000001"/);
+  const workflow = parse((await read('.github/workflows/mobile.yml')).toString());
+  const step = workflow.jobs.ios.steps.find((s) => s.name === 'Verify cached development entry and recovery in iOS Simulator');
+  assert.match(step.run, /-scheme DevelopmentViewTests/);
+  assert.match(step.run, /platform=iOS Simulator/);
+  assert.match(step.run, /CODE_SIGNING_ALLOWED=NO test/);
+});
+test('mobile release contains complete application assets and produces identical ZIP bytes twice', async () => {
+  const build = () => execFileSync(process.execPath, ['mobile/scripts/build.mjs', '--release'], { cwd: root });
+  build();
+  const meta = JSON.parse(await read('web/mobile/manifest.json'));
+  const pkg = JSON.parse(await read('package.json'));
+  assert.equal(meta.frontendVersion, pkg.version);
+  assert.equal(meta.nativeRevision, NATIVE_REVISION);
+  assert.notEqual(meta.nativeRevision, 3, 'legacy protocol-3 updaters must request a new APK/IPA');
+  assert.deepEqual(meta.minimumNativeBuilds, await readNativeBuilds());
+  const zip = await read('web/mobile/' + meta.bundle);
+  assert.equal(createHash('sha256').update(zip).digest('hex'), meta.checksum);
+  assert.equal(zip.length, meta.size);
+  const entries = unzipSync(zip);
+  for (const name of ['index.html', 'player.html', 'js/home.js', 'js/main.js', 'native.js', 'native-bundle.json', 'js/native-caption-pip.js', 'js/native-audio.js']) {
+    assert.ok(entries[name], name);
+  }
+  for (const name of ['js/voice-pack-worker.js', 'js/supertonic-worker.js', 'js/supertonic-text.js', 'js/vendor/supertonic/MODEL-LICENSE', 'js/vendor/piper/ort.wasm.min.js', 'js/vendor/piper/piper_phonemize.js']) assert.ok(entries[name], name);
+  assert.ok(!Object.keys(entries).some((name) => /\.onnx$|piper_phonemize\.(wasm|data)$|ort-wasm\.wasm$/.test(name)), 'voice models and binary runtimes are user downloads');
+  for (const dir of ['css', 'js', 'js/vendor']) {
+    for (const file of await readdir(new URL('../web/' + dir, import.meta.url), { withFileTypes: true })) {
+      if (file.isFile()) assert.ok(entries[dir + '/' + file.name], `missing ${dir}/${file.name}`);
+    }
+  }
+  const bundledMeta = JSON.parse(Buffer.from(entries['native-bundle.json']));
+  assert.equal(bundledMeta.version, meta.version);
+  assert.equal(bundledMeta.frontendVersion, pkg.version);
+  assert.deepEqual(bundledMeta.minimumNativeBuilds, meta.minimumNativeBuilds);
+  const versionModule = await read('web/js/version.js');
+  const { FRONTEND_VERSION } = await import(`data:text/javascript;base64,${versionModule.toString('base64')}`);
+  assert.equal(FRONTEND_VERSION, pkg.version);
+  assert.deepEqual(Buffer.from(entries['js/version.js']), versionModule);
+  assert.match(Buffer.from(entries['index.html']).toString(), /await ready; await import\("\.\/js\/home.js"\)/);
+  assert.ok(Object.keys(entries).every((p) => !p.startsWith('data/') && !p.startsWith('mobile/') && !p.includes('node_modules')));
+  build();
+  assert.deepEqual(JSON.parse(await read('web/mobile/manifest.json')), meta);
+  assert.deepEqual(await read('web/mobile/' + meta.bundle), zip);
+  const browser = unzipSync(await read('web/mobile/Lingua-web.zip'));
+  assert.ok(browser['index.html'] && browser['js/home.js']);
+  assert.deepEqual(Buffer.from(browser['js/version.js']), versionModule);
+  assert.equal(browser['native.js'], undefined);
+  assert.equal(browser['assets/pip-black.mp4'], undefined);
+  assert.equal(browser['js/caption-video.js'], undefined);
+  const development = JSON.parse(Buffer.from(browser['development-cache.json']));
+  for (const file of development.files) {
+    assert.equal(createHash('sha256').update(browser[file.path]).digest('hex'), file.sha256, file.path);
+    assert.equal(browser[file.path].length, file.size, file.path);
+  }
+  assert.doesNotMatch(Buffer.from(browser['index.html']).toString(), /await ready/);
+});
+test('GitHub workflow exposes Android, signed iOS and update artifacts with no credentials required for PR checks', async () => {
+  const workflow = parse((await read('.github/workflows/mobile.yml')).toString());
+  assert.ok(workflow.on.workflow_dispatch !== undefined);
+  assert.deepEqual(Object.keys(workflow.jobs), ['frontend', 'android', 'ios', 'publish']);
+  for (const name of ['frontend', 'android', 'ios']) assert.ok(workflow.jobs[name].steps.some((s) => s.uses === 'actions/upload-artifact@v4'));
+  assert.equal(workflow.on.release, undefined);
+  assert.deepEqual(workflow.on.push.branches, ['main']);
+  assert.deepEqual(workflow.on.push.tags, ['v*']);
+  assert.equal(workflow.jobs.publish.permissions.contents, 'write');
+  assert.deepEqual(workflow.jobs.publish.needs, ['frontend', 'android', 'ios']);
+  assert.match(workflow.jobs.publish.if, /pull_request/);
+  const androidSetup = workflow.jobs.android.steps.find((s) => s.uses === 'android-actions/setup-android@v3');
+  assert.doesNotMatch(androidSetup.with.packages, /(?:^|\s)tools(?:\s|$)/);
+  assert.match(androidSetup.with.packages, /platforms;android-36/);
+  assert.match(androidSetup.with.packages, /build-tools;36\.0\.0/);
+  const androidArtifact = workflow.jobs.android.steps.find((s) => s.uses === 'actions/upload-artifact@v4');
+  assert.match(androidArtifact.with.path, /android\/dist\/Lingua\.apk/);
+  assert.doesNotMatch(androidArtifact.with.path, /android\/dist\/Lingua\.aab/);
+  const androidBuild = workflow.jobs.android.steps.find((s) => s.name === 'Build APKs');
+  assert.match(androidBuild.run, /assembleDebug assembleRelease/);
+  assert.doesNotMatch(androidBuild.run, /bundleRelease/);
+  const developmentTest = workflow.jobs.android.steps.find((s) => s.name === 'Verify cached development entry and renderer recovery in Android Emulator');
+  assert.match(developmentTest.uses, /^reactivecircus\/android-emulator-runner@/);
+  assert.match(developmentTest.with.script, /:app:connectedDebugAndroidTest/);
+  assert.match(developmentTest.with.script, /app\.linguatrack\.mobile\.DevelopmentActivityTest/);
+  const ios = workflow.jobs.ios.steps.find((s) => s.name === 'Export signed IPA when credentials are configured');
+  assert.match(ios.run, /IOS_CERTIFICATE_BASE64/);
+  assert.match(ios.run, /mobile\/scripts\/ios-release\.py/);
+  assert.ok(workflow.jobs.ios.env.IOS_CERTIFICATE_BASE64);
+  const unsignedIpa = workflow.jobs.ios.steps.find((s) => s.name === 'Package unsigned IPA');
+  assert.match(unsignedIpa.if, /hashFiles\('ios\/App\/build\/ipa\/Lingua\.ipa'\) == ''/);
+  assert.match(unsignedIpa.env.APP_PATH, /Release-iphoneos\/App\.app/);
+  assert.match(unsignedIpa.run, /mobile-artifacts\/Lingua\.ipa/);
+  const signedIpa = workflow.jobs.ios.steps.find((s) => s.name === 'Collect signed IPA');
+  assert.match(signedIpa.if, /hashFiles\('ios\/App\/build\/ipa\/Lingua\.ipa'\) != ''/);
+  assert.match(signedIpa.run, /mobile-artifacts\/Lingua\.ipa/);
+  const config = JSON.parse(await read('capacitor.config.json'));
+  assert.equal(config.plugins.CapacitorUpdater.autoUpdate, false);
+  assert.equal(config.plugins.CapacitorUpdater.statsUrl, '');
+  assert.equal(config.server.url, undefined);
+  assert.equal(config.appName, 'Lingua');
+  assert.equal(config.ios.contentInset, 'never');
+});

@@ -1,0 +1,339 @@
+package app.linguatrack.mobile;
+
+import androidx.activity.ComponentActivity;
+import androidx.activity.OnBackPressedCallback;
+import android.content.Intent;
+import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.view.Gravity;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.ViewConfiguration;
+import android.webkit.*;
+import android.widget.*;
+import androidx.core.graphics.Insets;
+import androidx.core.view.*;
+import androidx.webkit.WebViewCompat;
+import androidx.webkit.WebViewFeature;
+import org.json.JSONObject;
+
+/** Remote browsing has no Capacitor bridge; its only message is a presentation hint. */
+public class DevelopmentActivity extends ComponentActivity {
+    private static final String FAILED_URL_KEY = "lingua.development-failed-url";
+    private WebView web;
+    private FrameLayout root;
+    private Button bubble, reload, cacheButton, back;
+    private LinearLayout menu;
+    private TextView errorLabel;
+    private String url;
+    private ValueCallback<Uri[]> files;
+    private Insets safe = Insets.NONE;
+    private boolean dark, immersive, placed, dragging;
+    private float downX, downY, startX, startY;
+    private androidx.webkit.ScriptHandler presentationScript;
+    private String insetValues = "";
+    private DevelopmentCache cache;
+    private volatile boolean cached;
+    private boolean cacheNotice;
+    private String pendingNotice;
+    private int reloadGeneration;
+    private final java.util.concurrent.ExecutorService cacheWorker = java.util.concurrent.Executors.newSingleThreadExecutor();
+
+    static boolean validUrl(String raw) {
+        if (raw == null) return false;
+        Uri uri = Uri.parse(raw);
+        return ("https".equals(uri.getScheme()) || "http".equals(uri.getScheme()))
+            && uri.getHost() != null && uri.getUserInfo() == null;
+    }
+    private int dp(float value) { return Math.round(value * getResources().getDisplayMetrics().density); }
+    private GradientDrawable surface(int color, int radius) {
+        GradientDrawable shape = new GradientDrawable(); shape.setColor(color); shape.setCornerRadius(dp(radius)); return shape;
+    }
+    @Override public void onCreate(Bundle saved) {
+        super.onCreate(saved);
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override public void handleOnBackPressed() { navigateBack(); }
+        });
+        WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
+        getWindow().setStatusBarColor(Color.TRANSPARENT);
+        getWindow().setNavigationBarColor(Color.TRANSPARENT);
+        if (Build.VERSION.SDK_INT >= 29) getWindow().setNavigationBarContrastEnforced(false);
+        url = getSharedPreferences("CapacitorStorage", MODE_PRIVATE).getString("lingua.development-url", "");
+        if (validUrl(url)) try {
+            cache = new DevelopmentCache(new java.io.File(getFilesDir(), "development-cache"), url);
+            cached = cache.available();
+        } catch (Exception ignored) { }
+        root = new FrameLayout(this);
+        createControls(); setContentView(root);
+        ViewCompat.setOnApplyWindowInsetsListener(root, (view, insets) -> {
+            // The canvas fills the window; only controls consume physical safe areas.
+            safe = insets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
+            injectInsets(); placeControls(); return insets;
+        });
+        root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> placeControls());
+        applyTheme(); ViewCompat.requestApplyInsets(root);
+        if (url.equals(getSharedPreferences("CapacitorStorage", MODE_PRIVATE).getString(FAILED_URL_KEY, null))) {
+            showError("上次开发网页异常退出；可刷新重试或返回上一个分支");
+        } else if (createWebView()) loadPage();
+    }
+    private boolean createWebView() {
+        if (web != null) return true;
+        try {
+            initializeWebView();
+            return true;
+        } catch (RuntimeException error) {
+            disposeWebView();
+            showError("无法初始化系统 WebView；可更新 Android System WebView 后刷新，或返回上一个分支");
+            return false;
+        }
+    }
+    private void initializeWebView() {
+        web = new WebView(this);
+        web.getSettings().setJavaScriptEnabled(true);
+        web.getSettings().setDomStorageEnabled(true);
+        web.getSettings().setCacheMode(WebSettings.LOAD_NO_CACHE);
+        web.getSettings().setAllowFileAccess(false);
+        web.getSettings().setAllowContentAccess(false);
+        root.addView(web, 0, new FrameLayout.LayoutParams(-1, -1));
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+            WebViewCompat.addWebMessageListener(web, "LinguaPresentation", java.util.Collections.singleton("*"), (view, message, origin, mainFrame, reply) -> {
+                if (!mainFrame || view != web || isFinishing() || isDestroyed()) return;
+                try {
+                    JSONObject state = new JSONObject(message.getData());
+                    dark = state.optBoolean("dark"); immersive = state.optBoolean("immersive"); applyTheme();
+                } catch (Exception ignored) { }
+            });
+        }
+        injectInsets();
+        web.setWebChromeClient(new WebChromeClient() {
+            @Override public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
+                if (files != null) files.onReceiveValue(null);
+                files = callback;
+                try { startActivityForResult(params.createIntent(), 100); }
+                catch (Exception error) { files.onReceiveValue(null); files = null; showError("无法打开文件选择器"); }
+                return true;
+            }
+        });
+        web.setWebViewClient(new WebViewClient() {
+            @Override public void onPageStarted(WebView view, String address, android.graphics.Bitmap icon) {
+                if (view != web) return;
+                immersive = false; applyTheme(); errorLabel.setVisibility(View.GONE); injectInsets();
+            }
+            @Override public void onPageFinished(WebView view, String address) {
+                if (view != web) return;
+                web.evaluateJavascript(PRESENTATION_SCRIPT, null); injectInsets();
+                if (pendingNotice != null) { showError(pendingNotice); pendingNotice = null; }
+                else if (cached && !cacheNotice) { cacheNotice = true; showError("正在使用已缓存源码；刷新可加载最新源码"); }
+            }
+            @Override public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                if (!cached || cache == null || !"GET".equals(request.getMethod())) return null;
+                DevelopmentCache.Entry entry = cache.entry(request.getUrl().toString());
+                if (entry == null) return null;
+                return new WebResourceResponse(entry.mime, "UTF-8", 200, "OK",
+                    java.util.Collections.singletonMap("Cache-Control", "no-store"), new java.io.ByteArrayInputStream(entry.bytes));
+            }
+            @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                return !validUrl(request.getUrl().toString());
+            }
+            @Override public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                if (view == web && request.isForMainFrame()) recoverCached(request.getUrl().toString(), "网页加载失败");
+            }
+            @Override public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse response) {
+                if (view == web && request.isForMainFrame()) recoverCached(request.getUrl().toString(), "网页暂时无法访问");
+            }
+            @Override public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                // Returning false lets Android kill this app along with the renderer.
+                // Keep native controls alive and never reuse the dead WebView.
+                if (view == web) {
+                    getSharedPreferences("CapacitorStorage", MODE_PRIVATE).edit().putString(FAILED_URL_KEY, url).apply();
+                    disposeWebView();
+                    immersive = false; applyTheme();
+                    showError("开发网页渲染进程已退出；可刷新重试或返回上一个分支");
+                }
+                return true;
+            }
+        });
+        applyTheme();
+    }
+    private void createControls() {
+        menu = new LinearLayout(this); menu.setOrientation(LinearLayout.VERTICAL); menu.setPadding(dp(12), dp(8), dp(12), dp(8));
+        menu.setElevation(dp(12)); menu.setVisibility(View.GONE);
+        errorLabel = new TextView(this); errorLabel.setTextSize(14); errorLabel.setPadding(dp(8), dp(8), dp(8), dp(8)); errorLabel.setVisibility(View.GONE);
+        reload = action("刷新网页", () -> {
+            reloadGeneration++;
+            cached = false; cacheNotice = false; pendingNotice = null; menu.setVisibility(View.GONE);
+            if (!createWebView()) return;
+            getSharedPreferences("CapacitorStorage", MODE_PRIVATE).edit().remove(FAILED_URL_KEY).apply();
+            String current = web.getUrl();
+            if (current != null && validUrl(current)) web.reload(); else loadPage();
+        });
+        cacheButton = action("缓存前端源码", this::cachePage);
+        back = action("返回上一个分支", this::returnToApp);
+        menu.addView(errorLabel); menu.addView(reload); menu.addView(cacheButton); menu.addView(back);
+        root.addView(menu, new FrameLayout.LayoutParams(dp(208), -2));
+        bubble = new Button(this); bubble.setText("‹/›"); bubble.setTextSize(18); bubble.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        bubble.setPadding(0, 0, 0, 0); bubble.setMinWidth(0); bubble.setMinHeight(0); bubble.setElevation(dp(8));
+        bubble.setContentDescription("开发控制");
+        root.addView(bubble, new FrameLayout.LayoutParams(dp(52), dp(52)));
+        bubble.setOnClickListener(v -> { menu.setVisibility(menu.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE); menu.post(this::placeControls); });
+        bubble.setOnTouchListener((v, event) -> {
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    downX = event.getRawX(); downY = event.getRawY(); startX = bubble.getX(); startY = bubble.getY(); dragging = false; return true;
+                case MotionEvent.ACTION_MOVE:
+                    float dx = event.getRawX() - downX, dy = event.getRawY() - downY;
+                    if (Math.hypot(dx, dy) > ViewConfiguration.get(this).getScaledTouchSlop()) dragging = true;
+                    if (dragging) { menu.setVisibility(View.GONE); bubble.setX(startX + dx); bubble.setY(startY + dy); placeControls(); }
+                    return true;
+                case MotionEvent.ACTION_UP:
+                    if (!dragging) v.performClick(); else placeControls(); return true;
+                case MotionEvent.ACTION_CANCEL: placeControls(); return true;
+                default: return false;
+            }
+        });
+    }
+    private Button action(String text, Runnable run) {
+        Button button = new Button(this); button.setText(text); button.setTextSize(15); button.setAllCaps(false);
+        button.setGravity(Gravity.START | Gravity.CENTER_VERTICAL); button.setPadding(dp(8), 0, dp(8), 0);
+        button.setBackgroundColor(Color.TRANSPARENT); button.setMinHeight(dp(48)); button.setOnClickListener(v -> run.run()); return button;
+    }
+    private float clamp(float value, float min, float max) { return Math.max(min, Math.min(value, Math.max(min, max))); }
+    private void placeControls() {
+        if (root.getWidth() == 0) return;
+        float left = safe.left + dp(12), top = safe.top + dp(12);
+        float right = root.getWidth() - safe.right - dp(12), bottom = root.getHeight() - safe.bottom - dp(12);
+        if (!placed) { bubble.setX(right - dp(52)); bubble.setY(top + (bottom - top) * .65f); placed = true; }
+        bubble.setX(clamp(bubble.getX(), left, right - dp(52))); bubble.setY(clamp(bubble.getY(), top, bottom - dp(52)));
+        menu.setX(clamp(bubble.getX() + dp(52) - menu.getWidth(), left, right - menu.getWidth()));
+        float above = bubble.getY() - menu.getHeight() - dp(10);
+        menu.setY(clamp(above >= top ? above : bubble.getY() + dp(62), top, bottom - menu.getHeight()));
+    }
+    private void applyTheme() {
+        int bg = immersive ? Color.BLACK : dark ? 0xff15170f : 0xfff2f2ea;
+        root.setBackgroundColor(bg); if (web != null) web.setBackgroundColor(bg);
+        menu.setBackground(surface(dark ? 0xff262b1b : 0xfff7f7f1, 20));
+        for (TextView label : new TextView[] { reload, cacheButton, back, errorLabel }) label.setTextColor(dark ? 0xffeef1e3 : 0xff1b1f16);
+        bubble.setBackground(surface(dark ? 0xff33421f : 0xffd7e6c4, 26)); bubble.setTextColor(dark ? 0xffa8d68a : 0xff4f7a37);
+        WindowInsetsControllerCompat bars = WindowCompat.getInsetsController(getWindow(), root);
+        bars.setAppearanceLightStatusBars(!dark && !immersive); bars.setAppearanceLightNavigationBars(!dark && !immersive);
+        bars.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+        if (immersive) bars.hide(WindowInsetsCompat.Type.systemBars()); else bars.show(WindowInsetsCompat.Type.systemBars());
+    }
+    private void injectInsets() {
+        if (web == null) return;
+        float density = getResources().getDisplayMetrics().density;
+        String values = "[" + safe.top / density + "," + safe.right / density + "," + safe.bottom / density + "," + safe.left / density + "]";
+        if (!values.equals(insetValues) && WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            insetValues = values;
+            if (presentationScript != null) presentationScript.remove();
+            presentationScript = WebViewCompat.addDocumentStartJavaScript(web,
+                "window.__linguaInsets=" + values + ";" + PRESENTATION_SCRIPT, java.util.Collections.singleton("*"));
+        }
+        web.evaluateJavascript("window.__linguaInsets=" + values + ";window.__linguaApplyInsets?.();", null);
+    }
+    private void showError(String message) {
+        errorLabel.setText(message); errorLabel.setVisibility(View.VISIBLE); menu.setVisibility(View.VISIBLE); menu.post(this::placeControls);
+    }
+    private void loadPage() { if (validUrl(url)) web.loadUrl(url); else showError("开发地址无效"); }
+    private void recoverCached(String address, String message) {
+        if (web == null || isFinishing() || isDestroyed()) return;
+        if (!cached && cache != null && cache.contains(address)) {
+            cached = true; cacheNotice = true;
+            pendingNotice = "开发服务器不可用，已使用缓存源码";
+            web.loadUrl(address);
+        } else showError(message);
+    }
+    private void cachePage() {
+        if (cache == null) { showError("开发地址无效"); return; }
+        cacheButton.setEnabled(false); cacheButton.setText("正在缓存…");
+        int generation = reloadGeneration;
+        showError("正在下载完整前端源码…");
+        cacheWorker.execute(() -> {
+            try {
+                int count = cache.download();
+                runOnUiThread(() -> {
+                    if (isFinishing() || isDestroyed()) return;
+                    if (web == null) { showError("已缓存 " + count + " 个文件；网页已退出，可刷新重试或返回"); return; }
+                    if (generation != reloadGeneration) {
+                        showError("已缓存 " + count + " 个文件；当前继续使用联网源码"); return;
+                    }
+                    cached = true; cacheNotice = true;
+                    pendingNotice = "已缓存 " + count + " 个文件，可关闭开发服务器测试";
+                    String current = web.getUrl();
+                    if (current != null && cache.contains(current)) web.reload(); else web.loadUrl(url);
+                });
+            } catch (Exception error) {
+                runOnUiThread(() -> { if (!isDestroyed()) showError("缓存失败，原有缓存保留；请确认服务器在线且支持缓存清单"); });
+            } finally {
+                runOnUiThread(() -> {
+                    if (!isDestroyed()) { cacheButton.setEnabled(true); cacheButton.setText("缓存前端源码"); }
+                });
+            }
+        });
+    }
+    @Override protected void onActivityResult(int request, int result, Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request == 100 && files != null) {
+            Uri[] selected = null;
+            if (result == RESULT_OK && data != null && data.getClipData() != null) {
+                android.content.ClipData clip = data.getClipData();
+                selected = new Uri[clip.getItemCount()];
+                for (int i = 0; i < selected.length; i++) selected[i] = clip.getItemAt(i).getUri();
+            } else selected = WebChromeClient.FileChooserParams.parseResult(result, data);
+            files.onReceiveValue(selected); files = null;
+        }
+    }
+    static void restorePreviousChannel(android.content.Context context) {
+        android.content.SharedPreferences prefs = context.getSharedPreferences("CapacitorStorage", MODE_PRIVATE);
+        String previous = prefs.getString("lingua.previous-channel", "stable");
+        if (!java.util.Arrays.asList("stable", "own", "preview").contains(previous)) previous = "stable";
+        prefs.edit().putString("lingua.channel", previous).apply();
+    }
+    private void returnToApp() {
+        restorePreviousChannel(this);
+        startActivity(new Intent(this, MainActivity.class).setAction(Intent.ACTION_APPLICATION_PREFERENCES)); finish();
+    }
+    private void navigateBack() {
+        if (web == null) returnToApp();
+        else if (menu.getVisibility() == View.VISIBLE) menu.setVisibility(View.GONE);
+        else web.evaluateJavascript("window.dispatchEvent(new CustomEvent('native-back',{cancelable:true}))", (unhandled) -> {
+            if (web == null || isFinishing() || isDestroyed()) return;
+            if ("false".equals(unhandled)) return;
+            if (web.canGoBack()) web.goBack(); else returnToApp();
+        });
+    }
+    private void disposeWebView() {
+        if (files != null) { files.onReceiveValue(null); files = null; }
+        presentationScript = null; insetValues = "";
+        WebView previous = web; web = null;
+        if (previous != null) { root.removeView(previous); previous.destroy(); }
+    }
+    @Override protected void onDestroy() {
+        cacheWorker.shutdownNow();
+        disposeWebView();
+        super.onDestroy();
+    }
+    private static final String PRESENTATION_SCRIPT = """
+        (() => {
+          if (window.__linguaPresentation) return;
+          window.__linguaPresentation = true;
+          const install = () => {
+            const root = document.documentElement;
+            if (!root) return;
+            root.classList.add('native-app');
+            window.__linguaApplyInsets = () => {
+              (window.__linguaInsets || [0,0,0,0]).forEach((v,i) => root.style.setProperty('--native-safe-' + ['t','r','b','l'][i], v + 'px'));
+            };
+            window.__linguaApplyInsets();
+            const sync = () => window.LinguaPresentation?.postMessage(JSON.stringify({dark:root.dataset.theme === 'dark',immersive:root.classList.contains('video-immersive')}));
+            new MutationObserver(sync).observe(root,{attributes:true,attributeFilter:['class','data-theme']});
+            sync();
+          };
+          if (document.documentElement) install(); else document.addEventListener('DOMContentLoaded',install,{once:true});
+        })();
+        """;
+}

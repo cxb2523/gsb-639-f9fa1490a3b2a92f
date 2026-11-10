@@ -1,0 +1,598 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { build } from 'esbuild';
+import { JSDOM } from 'jsdom';
+import { fileURLToPath } from 'node:url';
+import { CHECK_TIMEOUT_MS, NATIVE_REVISION } from '../mobile/src/update.js';
+import releaseConfig from '../mobile/release-config.json' with { type: 'json' };
+
+const result = await build({
+  entryPoints: [fileURLToPath(new URL('../mobile/src/runtime.js', import.meta.url))],
+  bundle: true, write: false, format: 'iife', globalName: 'NativeTest',
+  plugins: [{ name: 'native-test-adapter', setup(b) {
+    b.onResolve({ filter: /^@(capacitor|capgo)\// }, (args) => ({ path: args.path, namespace: 'mock' }));
+    b.onLoad({ filter: /.*/, namespace: 'mock' }, () => ({ contents: `
+      export const { Capacitor, CapacitorHttp, registerPlugin, SystemBars, SystemBarType, Preferences, CapacitorUpdater,
+        App, SplashScreen, Filesystem, Directory, Share } = window.adapters;`, loader: 'js' }));
+  } }],
+});
+const code = result.outputFiles[0].text;
+async function harness(saved = {}, options = {}) {
+  const dom = new JSDOM('<html><head></head><body></body></html>', { url: 'https://localhost/index.html', runScripts: 'outside-only' });
+  const { window } = dom;
+  const values = new Map(Object.entries(saved));
+  const calls = [], events = {}, presentations = [], systemBars = [], exports = new Map(), shares = [];
+  window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
+  window.HTMLDialogElement.prototype.close = function () { this.open = false; this.dispatchEvent(new window.Event('close')); };
+  window.confirm = () => true;
+  for (const [key, value] of Object.entries(options.session || {})) window.sessionStorage.setItem(key, value);
+  window.fetch = async () => ({ json: async () => ({ version: 'a'.repeat(64) }) });
+  window.adapters = {
+    Capacitor: { isNativePlatform: () => true, getPlatform: () => options.platform || 'ios',
+      isPluginAvailable: (name) => (name === 'CaptionPip' && !!options.captionPip) || (name === 'AudioPlayer' && !!options.audioPlayer)
+        || (name === 'SpeechAudio' && !!options.speechAudio) },
+    CapacitorHttp: { get: async () => { calls.push('network'); if (options.response) return options.response(); throw Error('offline'); } },
+    SystemBars: {
+      hide: async (options) => { systemBars.push({ action: 'hide', ...options }); },
+      show: async (options) => { systemBars.push({ action: 'show', ...options }); },
+    },
+    SystemBarType: { NavigationBar: 'NavigationBar' },
+    registerPlugin: (name) => name === 'AudioPlayer' && options.audioPlayer ? options.audioPlayer
+      : name === 'SpeechAudio' && options.speechAudio ? options.speechAudio
+      : name === 'CaptionPip' && options.captionPip ? options.captionPip : ({ openDevelopment: async ({ url }) => { calls.push(['development', url]); },
+      setPresentation: async (value) => { presentations.push({ ...value }); }, addListener: async () => {} }),
+    Preferences: { get: async ({ key }) => ({ value: values.get(key) ?? null }),
+      set: async ({ key, value }) => { values.set(key, value); } },
+    CapacitorUpdater: { current: async () => ({ bundle: { id: 'builtin' } }), list: async () => ({ bundles: [] }),
+      ...options.updater,
+      notifyAppReady: async () => { calls.push('ready'); }, reset: async () => { calls.push('reset'); } },
+    App: { getInfo: options.getInfo || (async () => ({ build: options.nativeBuild || '100' })),
+      addListener: async (name, handler) => { events[name] = handler; }, minimizeApp: () => { calls.push('minimize'); } },
+    SplashScreen: { hide: async () => { calls.push('splash'); } },
+    Filesystem: {
+      readdir: async () => ({ files: [...exports].map(([path, value]) => ({ name: path.slice(8), ...value })) }),
+      writeFile: async ({ path, data }) => { exports.set(path, { data, type: 'file', mtime: Date.now() }); return { uri: 'file:///' + path }; },
+      deleteFile: async ({ path }) => { exports.delete(path); },
+    }, Directory: { Cache: 'CACHE' }, Share: { share: async (value) => { shares.push(value); } },
+  };
+  window.eval(code);
+  if (!options.development) await window.NativeTest.ready;
+  else await new Promise((resolve) => setImmediate(resolve));
+  return { window, values, calls, events, presentations, systemBars, exports, shares, close: () => window.close() };
+}
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+const ownSource = { channel: 'own', ownUrl: 'https://site.example/', developmentUrl: '' };
+const ownSaved = { 'lingua.channel': 'own', 'lingua.own-url': ownSource.ownUrl,
+  'lingua.native.state': JSON.stringify({ source: ownSource, pending: null }) };
+const updateManifest = { schema: 1, appId: 'app.linguatrack.mobile', nativeRevision: NATIVE_REVISION,
+  minimumNativeBuilds: { android: 10, ios: 13 },
+  version: 'b'.repeat(64), checksum: 'c'.repeat(64), bundle: `bundle-${'b'.repeat(64)}.zip`, size: 100 };
+const updateResponse = async () => ({ status: 200, data: updateManifest });
+const clickText = (h, text) => [...h.window.document.querySelectorAll('button')].find((b) => b.textContent === text).click();
+
+test('native audio is independent of PiP support and forwards native events to the player', async (t) => {
+  let listener;
+  const bridge = { addListener: async (name, handler) => { assert.equal(name, 'stateChanged'); listener = handler; } };
+  const h = await harness({}, { audioPlayer: bridge }); t.after(h.close);
+  assert.ok(h.window.LinguaNative.audioPlayer); assert.equal(h.window.LinguaNative.captionPip, null);
+  assert.equal(h.window.LinguaNative.nativeVideoAudio, false);
+  let received;
+  h.window.addEventListener('native-audio-state', ({ detail }) => { received = detail; });
+  listener({ session: 'lesson', position: 15, paused: false });
+  assert.equal(received.position, 15); assert.equal(received.paused, false);
+  const browser = await harness({}, { platform: 'android', audioPlayer: bridge }); t.after(browser.close);
+  assert.ok(browser.window.LinguaNative.audioPlayer);
+});
+
+test('video audio is enabled only by binaries supporting the extended native API', async (t) => {
+  for (const supported of [false, true]) {
+    const h = await harness({}, { audioPlayer: { addListener: async () => {}, capabilities: async () => ({ videoAudio: supported }) } });
+    t.after(h.close);
+    assert.equal(h.window.LinguaNative.nativeVideoAudio, supported);
+  }
+});
+
+test('PCM speech is exposed only on supporting Android/iOS binaries and forwards its own events', async (t) => {
+  for (const platform of ['ios', 'android']) {
+    for (const supported of [false, true]) {
+      let listener;
+      const bridge = { capabilities: async () => ({ pcmVolume: supported, voices: [{ voiceURI: 'system-en', lang: 'en-US' }] }),
+        addListener: async (name, callback) => { assert.equal(name, 'stateChanged'); listener = callback; } };
+      const h = await harness({}, { platform, speechAudio: bridge }); t.after(h.close);
+      const expected = supported;
+      assert.equal(!!h.window.LinguaNative.speechAudio, expected);
+      assert.equal(h.window.LinguaNative.speechLoudness, false, 'older PCM binaries keep the gain contract');
+      assert.equal(h.window.LinguaNative.speechVoices.length, expected ? 1 : 0);
+      if (expected) {
+        let detail;
+        h.window.addEventListener('native-speech-state', (event) => { detail = event.detail; });
+        listener({ id: 'utterance', state: 'playing' });
+        assert.equal(detail.id, 'utterance');
+      }
+    }
+  }
+  const old = await harness({}, { speechAudio: { capabilities: async () => { throw Error('unavailable'); } } }); t.after(old.close);
+  assert.equal(old.window.LinguaNative.speechAudio, null);
+});
+
+test('native loudness and external PCM are separately detected and gated by speech support', async (t) => {
+  for (const pcmVolume of [false, true]) {
+    const h = await harness({}, { speechAudio: {
+      capabilities: async () => ({ pcmVolume, loudnessNormalization: true, externalPCM: true }), addListener: async () => {},
+    } }); t.after(h.close);
+    assert.equal(h.window.LinguaNative.speechLoudness, pcmVolume);
+    assert.equal(h.window.LinguaNative.speechPCM, pcmVolume);
+  }
+});
+
+test('caption windows are exposed only by mobile binaries reporting native support', async (t) => {
+  for (const [platform, available, supported] of [['ios', true, true], ['ios', true, false], ['ios', false, false],
+    ['android', true, true], ['android', true, false], ['android', false, false]]) {
+    let listener, probes = 0;
+    const bridge = { capabilities: async () => { probes++; return { supported }; },
+      addListener: async (name, handler) => { assert.equal(name, 'stateChanged'); listener = handler; } };
+    const h = await harness({}, { platform, captionPip: available ? bridge : null }); t.after(h.close);
+    const exposed = available && supported;
+    assert.equal(!!h.window.LinguaNative.captionPip, exposed);
+    assert.equal(probes, available ? 1 : 0);
+    if (exposed) {
+      let event;
+      h.window.addEventListener('native-caption-pip', (value) => { event = value.detail; });
+      listener({ active: true, session: 'lesson' });
+      assert.equal(event.session, 'lesson'); assert.equal(event.active, true);
+    }
+  }
+});
+
+test('failed native capability detection leaves the player usable with its caption entry hidden', async (t) => {
+  const h = await harness({}, { captionPip: { addListener: async () => {}, capabilities: async () => { throw Error('unsupported'); } } }); t.after(h.close);
+  assert.equal(h.window.LinguaNative.captionPip, null);
+  await h.window.LinguaNative.markReady();
+  assert.ok(h.calls.includes('ready'));
+});
+
+test('foreground and playback probes can enable a temporarily unavailable native caption entry', async (t) => {
+  let supported = false, events = 0;
+  const h = await harness({}, { captionPip: { addListener: async () => {}, capabilities: async () => ({ supported }) } }); t.after(h.close);
+  assert.equal(h.window.LinguaNative.captionPip, null);
+  h.window.addEventListener('native-caption-capabilities', () => events++);
+  supported = true;
+  await h.window.LinguaNative.refreshCaptionPip();
+  assert.ok(h.window.LinguaNative.captionPip); assert.equal(events, 1);
+  supported = false;
+  await h.events.appStateChange({ isActive: true }); await flush();
+  assert.equal(h.window.LinguaNative.captionPip, null);
+});
+
+test('startup asks before downloading; later, foreground and document navigation stay quiet', async (t) => {
+  let downloads = 0;
+  const options = { response: updateResponse, updater: { download: async () => { downloads++; } } };
+  const h = await harness(ownSaved, options); t.after(h.close);
+  await h.window.LinguaNative.markReady(); await flush();
+  assert.match(h.window.document.querySelector('#native-update').textContent, /发现新版本/);
+  assert.equal(downloads, 0);
+  clickText(h, '稍后'); await flush();
+  await h.window.LinguaNative.markReady();
+  await h.events.appStateChange({ isActive: true });
+  assert.equal(h.window.document.querySelector('#native-update'), null);
+  assert.equal(h.calls.filter((c) => c === 'network').length, 1);
+  const session = Object.fromEntries(Object.entries(h.window.sessionStorage));
+  const navigated = await harness(Object.fromEntries(h.values), { ...options, session }); t.after(navigated.close);
+  await navigated.window.LinguaNative.markReady(); await flush();
+  assert.equal(navigated.calls.includes('network'), false);
+  await navigated.window.LinguaNative.checkUpdates();
+  assert.match(navigated.window.document.querySelector('#native-update').textContent, /发现新版本/);
+  assert.equal(downloads, 0);
+  const relaunched = await harness(Object.fromEntries(h.values), options); t.after(relaunched.close);
+  await relaunched.window.LinguaNative.markReady(); await flush();
+  assert.equal(relaunched.calls.includes('network'), true);
+});
+
+test('confirmed update downloads once, blocks dismiss while busy and applies after verification', async (t) => {
+  let finish, downloads = 0, activated = 0;
+  const bundles = [];
+  const bundle = { id: 'downloaded', version: updateManifest.version, checksum: updateManifest.checksum, status: 'pending' };
+  const h = await harness(ownSaved, { response: updateResponse, updater: {
+    list: async () => ({ bundles }),
+    download: async () => { downloads++; await new Promise((resolve) => { finish = resolve; }); bundles.push(bundle); return bundle; },
+    set: async () => { activated++; },
+  } }); t.after(h.close);
+  await h.window.LinguaNative.checkUpdates();
+  clickText(h, '立即更新'); await flush();
+  const dialog = h.window.document.querySelector('#native-update');
+  assert.match(dialog.textContent, /正在下载并校验/);
+  assert.equal([...dialog.querySelectorAll('button')].every((b) => b.disabled), true);
+  const cancel = new h.window.Event('cancel', { cancelable: true }); dialog.dispatchEvent(cancel);
+  assert.equal(cancel.defaultPrevented, true);
+  h.events.backButton({ canGoBack: false }); assert.equal(dialog.open, true);
+  assert.equal(downloads, 1); assert.equal(activated, 0);
+  finish(); await flush();
+  assert.equal(activated, 1);
+});
+
+test('failed download stays retryable without activation and a dismissed check does not reopen', async (t) => {
+  let downloads = 0, activated = 0;
+  const h = await harness(ownSaved, { response: updateResponse, updater: {
+    download: async () => { downloads++; throw Error('下载失败'); }, set: async () => { activated++; },
+  } }); t.after(h.close);
+  await h.window.LinguaNative.checkUpdates(); clickText(h, '立即更新'); await flush();
+  assert.match(h.window.document.querySelector('#native-update').textContent, /更新未完成.*下载失败.*重试/);
+  clickText(h, '重试'); await flush(); assert.equal(downloads, 2); assert.equal(activated, 0);
+  clickText(h, '稍后'); await flush();
+  let finish;
+  h.window.adapters.CapacitorHttp.get = () => new Promise((resolve) => { finish = resolve; });
+  const check = h.window.LinguaNative.checkUpdates();
+  clickText(h, '取消'); await flush(); finish(await updateResponse()); await check;
+  assert.equal(h.window.document.querySelector('#native-update'), null);
+});
+
+test('dismissing a manual check also suppresses an overlapping startup prompt', async (t) => {
+  let finish;
+  const h = await harness(ownSaved, { response: () => new Promise((resolve) => { finish = resolve; }) }); t.after(h.close);
+  await h.window.LinguaNative.markReady(); await flush();
+  const manual = h.window.LinguaNative.checkUpdates(); clickText(h, '取消'); await flush();
+  finish(await updateResponse()); await manual; await flush();
+  assert.equal(h.window.document.querySelector('#native-update'), null);
+});
+
+for (const platform of ['ios', 'android']) {
+  test(`${platform} startup and manual checks direct native-incompatible updates to the repository without downloading`, async (t) => {
+    const incompatible = { ...updateManifest, nativeRevision: NATIVE_REVISION + 1 };
+    const pending = { id: 'already-downloaded', version: 'd'.repeat(64), checksum: 'e'.repeat(64) };
+    const saved = { ...ownSaved, 'lingua.native.state': JSON.stringify({ source: ownSource, pending }) };
+    const h = await harness(saved, { platform, response: async () => ({ status: 200, data: incompatible }),
+      updater: { list: async () => ({ bundles: [{ ...pending, status: 'pending' }] }),
+        download: () => assert.fail('incompatible updates cannot download'),
+        set: () => assert.fail('incompatible updates cannot activate') } });
+    t.after(h.close);
+    const assertPrompt = () => {
+      const dialogs = h.window.document.querySelectorAll('#native-update');
+      assert.equal(dialogs.length, 1);
+      const dialog = dialogs[0];
+      assert.equal(dialog.querySelector('h2').textContent, '需要更新应用');
+      assert.equal(dialog.querySelector('p').textContent, '请到仓库下载最新版应用');
+      assert.equal(dialog.querySelector('.native-actions').textContent, '稍后前往仓库');
+      const link = dialog.querySelector('a');
+      assert.equal(link.href, `https://github.com/${releaseConfig.repository}/releases`);
+      assert.equal(link.target, '_blank');
+      assert.equal(link.rel, 'noopener noreferrer');
+    };
+    await h.window.LinguaNative.markReady(); await flush();
+    assertPrompt();
+    clickText(h, '稍后'); await flush();
+    await h.events.appStateChange({ isActive: true });
+    assert.equal(h.window.document.querySelector('#native-update'), null);
+    assert.equal(h.calls.filter((call) => call === 'network').length, 1);
+    await h.window.LinguaNative.checkUpdates();
+    assertPrompt();
+    assert.equal(h.values.get('lingua.native.state'), saved['lingua.native.state']);
+  });
+}
+
+test('installed build read failures are silent at startup and actionable during manual checks', async (t) => {
+  const h = await harness(ownSaved, { response: updateResponse, getInfo: async () => { throw Error('应用版本读取失败'); } });
+  t.after(h.close);
+  await h.window.LinguaNative.markReady(); await flush();
+  assert.equal(h.window.document.querySelector('#native-update'), null);
+  await h.window.LinguaNative.checkUpdates();
+  assert.equal(h.window.document.querySelector('#native-update h2').textContent, '无法检查更新');
+  assert.match(h.window.document.querySelector('#native-update p').textContent, /应用版本读取失败/);
+});
+
+test('a saved update requiring a newer binary opens the reinstall action before activation', async (t) => {
+  const pending = { id: 'pending', version: 'd'.repeat(64), checksum: 'e'.repeat(64),
+    nativeRevision: NATIVE_REVISION, minimumNativeBuilds: updateManifest.minimumNativeBuilds };
+  const saved = { ...ownSaved, 'lingua.native.state': JSON.stringify({ source: ownSource, pending }) };
+  const h = await harness(saved, { nativeBuild: '12', updater: {
+    list: async () => ({ bundles: [{ ...pending, status: 'pending' }] }),
+    set: () => assert.fail('an incompatible saved update must never activate'),
+  } });
+  t.after(h.close);
+  h.window.LinguaNative.settings();
+  clickText(h, '安装已下载的更新');
+  clickText(h, '立即更新'); await flush();
+  assert.equal(h.window.document.querySelector('#native-update h2').textContent, '需要更新应用');
+  assert.ok(h.window.document.querySelector('#native-update a'));
+  assert.equal(h.values.get('lingua.native.state'), saved['lingua.native.state']);
+});
+
+test('a cancelled manual check suppresses an overlapping startup incompatibility reminder', async (t) => {
+  let finish;
+  const h = await harness(ownSaved, { response: () => new Promise((resolve) => { finish = resolve; }) });
+  t.after(h.close);
+  await h.window.LinguaNative.markReady(); await flush();
+  const manual = h.window.LinguaNative.checkUpdates();
+  clickText(h, '取消'); await flush();
+  finish({ status: 200, data: { ...updateManifest, nativeRevision: NATIVE_REVISION + 1 } });
+  await manual; await flush();
+  assert.equal(h.window.document.querySelector('#native-update'), null);
+});
+
+for (const platform of ['ios', 'android']) {
+  test(`${platform} installed build determines reinstall prompts even on a hot-updated frontend`, async (t) => {
+    const required = updateManifest.minimumNativeBuilds[platform];
+    for (const build of [required - 1, required, required + 1]) {
+      const h = await harness(ownSaved, { platform, nativeBuild: String(build), response: updateResponse,
+        updater: { download: () => assert.fail('no download without approval'), set: () => assert.fail('no activation') } });
+      t.after(h.close);
+      await h.window.LinguaNative.markReady(); await flush();
+      assert.equal(h.window.document.querySelector('#native-update h2').textContent,
+        build < required ? '需要更新应用' : '发现新版本');
+      clickText(h, '稍后'); await flush();
+      await h.window.LinguaNative.checkUpdates();
+      assert.equal(h.window.document.querySelector('#native-update h2').textContent,
+        build < required ? '需要更新应用' : '发现新版本');
+    }
+  });
+}
+
+for (const channel of ['stable', 'preview', 'own', 'development']) {
+  test(`switching to ${channel} cancels a stalled startup check and ignores its late result`, async (t) => {
+    let finish;
+    const pending = { id: 'pending', version: 'd'.repeat(64), checksum: 'e'.repeat(64) };
+    const initialState = { source: ownSource, pending };
+    const h = await harness({ ...ownSaved, 'lingua.native.state': JSON.stringify(initialState) }, {
+      response: () => new Promise((resolve) => { finish = resolve; }),
+      updater: { list: async () => ({ bundles: [pending] }) },
+    }); t.after(h.close);
+    await h.window.LinguaNative.markReady(); await flush();
+    h.window.LinguaNative.settings();
+    const select = h.window.document.querySelector('select');
+    select.value = channel; select.dispatchEvent(new h.window.Event('change'));
+    h.window.document.querySelector('input').value = channel === 'development' ? 'http://localhost:5173/' : 'https://new.example/';
+    clickText(h, '保存并切换'); await flush();
+    assert.equal(h.values.get('lingua.channel'), channel);
+    assert.equal(h.window.document.querySelector('[data-native-status]').textContent, '');
+    if (channel === 'development') {
+      assert.ok(h.calls.some((call) => Array.isArray(call) && call[0] === 'development'));
+      assert.deepEqual(JSON.parse(h.values.get('lingua.native.state')), initialState);
+    } else {
+      assert.ok(h.calls.includes('reset'));
+      assert.equal(JSON.parse(h.values.get('lingua.native.state')).pending, null);
+    }
+    const switchedState = h.values.get('lingua.native.state');
+    // Old same-version results used to clear pending and write the old source back.
+    finish({ status: 200, data: { ...updateManifest, version: 'a'.repeat(64), bundle: `bundle-${'a'.repeat(64)}.zip` } });
+    await flush();
+    assert.equal(h.values.get('lingua.native.state'), switchedState);
+    assert.equal(h.window.document.querySelector('#native-update'), null);
+  });
+}
+
+for (const dismiss of ['cancel button', 'dialog close', 'Android back']) {
+  test(`${dismiss} releases a hung manual check and allows an immediate retry`, async (t) => {
+    const finishes = [];
+    const h = await harness(ownSaved, { platform: 'android', response: () => new Promise((resolve) => finishes.push(resolve)) });
+    t.after(h.close);
+    await h.window.LinguaNative.markReady(); await flush();
+    const manual = h.window.LinguaNative.checkUpdates();
+    if (dismiss === 'cancel button') clickText(h, '取消');
+    else if (dismiss === 'dialog close') h.window.document.querySelector('#native-update').close();
+    else h.events.backButton({ canGoBack: false });
+    await manual;
+    assert.equal(h.window.document.querySelector('#native-update'), null);
+    const retry = h.window.LinguaNative.checkUpdates();
+    assert.equal(finishes.length, 2);
+    finishes[0]({ status: 200, data: { ...updateManifest, nativeRevision: NATIVE_REVISION + 1 } }); await flush();
+    assert.equal(h.window.document.querySelector('#native-update h2').textContent, '正在检查更新');
+    finishes[1](await updateResponse()); await retry;
+    assert.equal(h.window.document.querySelector('#native-update h2').textContent, '发现新版本');
+  });
+}
+
+for (const manual of [false, true]) {
+  test(`${manual ? 'manual' : 'startup'} checks recover from a native HTTP timeout without restarting`, async (t) => {
+    const h = await harness(ownSaved, { response: () => new Promise(() => {}) }); t.after(h.close);
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    h.window.setTimeout = globalThis.setTimeout;
+    h.window.clearTimeout = globalThis.clearTimeout;
+    const task = manual ? h.window.LinguaNative.checkUpdates() : h.window.LinguaNative.markReady();
+    await flush();
+    t.mock.timers.tick(CHECK_TIMEOUT_MS);
+    await task; await flush();
+    if (manual) {
+      assert.match(h.window.document.querySelector('#native-update').textContent, /无法检查更新.*检查更新超时.*重试/);
+      h.window.adapters.CapacitorHttp.get = updateResponse;
+      clickText(h, '重试'); await flush();
+      assert.equal(h.window.document.querySelector('#native-update h2').textContent, '发现新版本');
+    } else assert.equal(h.window.document.querySelector('#native-update'), null);
+    h.window.LinguaNative.settings();
+    h.window.document.querySelector('select').value = 'preview';
+    clickText(h, '保存并切换'); await flush();
+    assert.equal(h.values.get('lingua.channel'), 'preview');
+    assert.ok(h.calls.includes('reset'));
+  });
+}
+
+test('restoring builtin cancels a stalled check and suppresses its late update prompt', async (t) => {
+  let finish;
+  const h = await harness(ownSaved, { response: () => new Promise((resolve) => { finish = resolve; }) }); t.after(h.close);
+  await h.window.LinguaNative.markReady(); await flush();
+  h.window.LinguaNative.settings(); clickText(h, '恢复内置版本'); await flush();
+  assert.ok(h.calls.includes('reset'));
+  finish(await updateResponse()); await flush();
+  assert.equal(h.window.document.querySelector('#native-update'), null);
+});
+
+test('a cancelled GitHub release request cannot start a later manifest request', async (t) => {
+  let finish;
+  const h = await harness({}, { response: () => new Promise((resolve) => { finish = resolve; }) }); t.after(h.close);
+  const task = h.window.LinguaNative.checkUpdates();
+  clickText(h, '取消'); await task;
+  finish({ status: 200, data: { draft: false, prerelease: false, assets: [{ id: 1, name: 'manifest.json',
+    browser_download_url: `https://github.com/${releaseConfig.repository}/releases/download/v1/manifest.json` }] } });
+  await flush();
+  assert.equal(h.calls.filter((call) => call === 'network').length, 1);
+  assert.equal(h.window.document.querySelector('#native-update'), null);
+});
+
+test('branch switching remains blocked throughout download and activation', async (t) => {
+  let finishDownload, finishApply;
+  const bundle = { id: 'downloaded', version: updateManifest.version, checksum: updateManifest.checksum, status: 'pending' };
+  const h = await harness(ownSaved, { response: updateResponse, updater: {
+    list: async () => ({ bundles: finishApply ? [bundle] : [] }),
+    download: () => new Promise((resolve) => { finishDownload = () => resolve(bundle); }),
+    set: () => new Promise((resolve) => { finishApply = resolve; }),
+  } }); t.after(h.close);
+  h.window.LinguaNative.settings();
+  h.window.document.querySelector('select').value = 'preview';
+  await h.window.LinguaNative.checkUpdates(); clickText(h, '立即更新'); await flush();
+  clickText(h, '保存并切换'); await flush();
+  assert.match(h.window.document.querySelector('[data-native-status]').textContent, /等待更新完成/);
+  assert.equal(h.values.get('lingua.channel'), 'own');
+  assert.equal(h.calls.includes('reset'), false);
+  h.window.adapters.CapacitorUpdater.list = async () => ({ bundles: [bundle] });
+  finishDownload(); await flush();
+  clickText(h, '保存并切换'); await flush();
+  assert.equal(h.values.get('lingua.channel'), 'own');
+  assert.equal(h.calls.includes('reset'), false);
+  finishApply(); await flush();
+});
+
+test('fresh boot defaults to stable and checks releases after readiness without a URL dialog', async (t) => {
+  const h = await harness(); t.after(h.close);
+  assert.deepEqual(h.calls, []);
+  await h.window.LinguaNative.markReady(); await flush();
+  assert.deepEqual(h.calls, ['ready', 'splash', 'network']);
+  assert.equal(h.window.document.querySelector('dialog'), null);
+  assert.equal(h.window.LinguaNative.channel, 'stable');
+  h.window.LinguaNative.settings();
+  const dialog = h.window.document.querySelector('dialog');
+  assert.match(dialog.textContent, /开发人员选项/);
+  assert.equal(dialog.querySelectorAll('option').length, 4);
+  assert.equal(dialog.querySelector('input').parentNode.hidden, true);
+});
+test('offline startup is silent while manual checks expose a recoverable error', async (t) => {
+  const ownUrl = 'https://site.example/';
+  const source = { channel: 'own', ownUrl, developmentUrl: '' };
+  const h = await harness({ 'lingua.channel': 'own', 'lingua.own-url': ownUrl,
+    'lingua.native.state': JSON.stringify({ source }) }); t.after(h.close);
+  assert.deepEqual(h.calls, []); assert.equal(h.window.LinguaNative.target, ownUrl);
+  await h.window.LinguaNative.markReady(); await flush();
+  assert.deepEqual(h.calls, ['ready', 'splash', 'network']);
+  h.window.LinguaNative.settings();
+  assert.equal(h.window.document.querySelector('[data-native-status]').textContent, '');
+  await h.window.LinguaNative.checkUpdates();
+  assert.match(h.window.document.querySelector('#native-update').textContent, /无法检查更新.*检查网络.*重试/);
+  assert.doesNotMatch(h.window.document.querySelector('#native-update').textContent, /offline/);
+  assert.ok(!h.calls.includes('reset'));
+});
+test('changing channel clears pending and implicit backend token while retaining user model configuration', async (t) => {
+  const h = await harness(); t.after(h.close);
+  h.window.localStorage.setItem('linguatrack.config.v1', JSON.stringify({ apiBase: '', apiToken: 'old-secret', apiKey: 'llm-key' }));
+  h.window.LinguaNative.settings();
+  const dialog = h.window.document.querySelector('dialog');
+  const select = dialog.querySelector('select'); select.value = 'own'; select.dispatchEvent(new h.window.Event('change'));
+  const input = dialog.querySelector('input'); input.value = 'https://new.example/'; input.dispatchEvent(new h.window.Event('input'));
+  dialog.querySelector('.native-button-primary').click(); await flush();
+  const config = JSON.parse(h.window.localStorage.getItem('linguatrack.config.v1'));
+  assert.equal(config.apiToken, ''); assert.equal(config.apiKey, 'llm-key');
+  assert.equal(h.values.get('lingua.channel'), 'own');
+  assert.equal(h.values.get('lingua.own-url'), 'https://new.example/');
+  assert.equal(JSON.parse(h.values.get('lingua.native.state')).pending, null);
+  assert.ok(h.calls.includes('reset'));
+});
+test('development gate opens remote native view without local entry, updater or network checks', async (t) => {
+  const url = 'http://192.168.1.2:5173/player.html?debug=1#test';
+  const h = await harness({ 'lingua.channel': 'development', 'lingua.development-url': url }, { development: true });
+  t.after(h.close);
+  assert.deepEqual(h.calls, [['development', url]]);
+  assert.equal(h.window.LinguaNative, undefined);
+});
+
+for (const channel of ['stable', 'own', 'preview']) {
+  test(`development remembers ${channel} and retains its local update state and credentials`, async (t) => {
+    const source = { channel, ownUrl: 'https://site.example/', developmentUrl: '' };
+    const pending = { id: 'pending', version: 'b'.repeat(64), checksum: 'c'.repeat(64) };
+    const h = await harness({ 'lingua.channel': channel, 'lingua.own-url': source.ownUrl,
+      'lingua.native.state': JSON.stringify({ source, pending }) },
+    { updater: { list: async () => ({ bundles: [pending] }) } });
+    t.after(h.close);
+    h.window.localStorage.setItem('linguatrack.config.v1', JSON.stringify({ apiToken: 'saved-token' }));
+    h.window.LinguaNative.settings();
+    const dialog = h.window.document.querySelector('dialog');
+    const select = dialog.querySelector('select');
+    select.value = 'development'; select.dispatchEvent(new h.window.Event('change'));
+    const input = dialog.querySelector('input');
+    input.value = 'http://192.168.1.2:5173/'; input.dispatchEvent(new h.window.Event('input'));
+    dialog.querySelector('.native-button-primary').click(); await flush();
+    assert.equal(h.values.get('lingua.previous-channel'), channel);
+    assert.equal(h.values.get('lingua.channel'), 'development');
+    assert.deepEqual(JSON.parse(h.values.get('lingua.native.state')), { source, pending });
+    assert.equal(JSON.parse(h.window.localStorage.getItem('linguatrack.config.v1')).apiToken, 'saved-token');
+    assert.ok(!h.calls.includes('reset'));
+    // Native return restores just the channel. Initialization must keep the downloaded bundle.
+    const returned = await harness({ ...Object.fromEntries(h.values), 'lingua.channel': channel },
+      { updater: { current: async () => ({ bundle: { id: 'downloaded' } }), list: async () => ({ bundles: [pending] }) } });
+    t.after(returned.close);
+    assert.equal(returned.window.LinguaNative.channel, channel);
+    assert.ok(!returned.calls.includes('reset'));
+  });
+}
+test('legacy target migrates to own channel without a first-run popup', async (t) => {
+  const h = await harness({ 'lingua.target': 'https://legacy.example/' }); t.after(h.close);
+  assert.equal(h.values.get('lingua.channel'), 'own');
+  assert.equal(h.window.LinguaNative.target, 'https://legacy.example/');
+  await h.window.LinguaNative.markReady();
+  assert.equal(h.window.document.querySelector('dialog'), null);
+});
+
+test('iOS system presentation follows immersion, theme, navigation and foreground restoration', async (t) => {
+  const h = await harness(); t.after(h.close);
+  const root = h.window.document.documentElement;
+  assert.deepEqual(h.presentations.at(-1), { immersive: false, dark: false });
+  root.classList.add('video-immersive'); await flush();
+  assert.deepEqual(h.presentations.at(-1), { immersive: true, dark: false });
+  const count = h.presentations.length;
+  root.classList.add('sheet-open'); await flush();
+  assert.equal(h.presentations.length, count, 'unrelated overlay state must not relayout UIKit');
+  root.dataset.theme = 'dark'; await flush();
+  assert.deepEqual(h.presentations.at(-1), { immersive: true, dark: true });
+  h.window.dispatchEvent(new h.window.Event('pagehide'));
+  assert.deepEqual(h.presentations.at(-1), { immersive: false, dark: true });
+  h.window.dispatchEvent(new h.window.Event('pageshow'));
+  assert.deepEqual(h.presentations.at(-1), { immersive: true, dark: true });
+  root.classList.remove('video-immersive'); await flush();
+  await h.events.appStateChange({ isActive: true });
+  assert.deepEqual(h.presentations.at(-1), { immersive: false, dark: true });
+  assert.deepEqual(h.systemBars, h.presentations.map(({ immersive }) => ({
+    action: immersive ? 'hide' : 'show', bar: 'NavigationBar',
+  })), 'Home indicator must follow native presentation through the built-in SystemBars plugin');
+});
+
+test('Android back closes topmost overlays and lets the player exit manual fullscreen first', async (t) => {
+  const h = await harness({}, { platform: 'android' }); t.after(h.close);
+  const doc = h.window.document;
+  doc.body.innerHTML = '<div class="wc-scrim is-open"></div><div class="sheet is-open"><div class="sheet-acts"><button aria-label="关闭"></button></div></div>';
+  const card = doc.querySelector('.wc-scrim'), sheet = doc.querySelector('.sheet');
+  card.onclick = () => card.remove();
+  sheet.querySelector('button').onclick = () => sheet.remove();
+  h.events.backButton({ canGoBack: false });
+  assert.equal(card.isConnected, false); assert.equal(sheet.isConnected, true);
+  h.events.backButton({ canGoBack: false });
+  assert.equal(sheet.isConnected, false);
+  h.window.addEventListener('native-back', (e) => e.preventDefault(), { once: true });
+  h.events.backButton({ canGoBack: false });
+  assert.equal(h.calls.includes('minimize'), false);
+  h.events.backButton({ canGoBack: false });
+  assert.equal(h.calls.includes('minimize'), true);
+  assert.equal(h.presentations.length, 0);
+  assert.equal(h.systemBars.length, 0);
+});
+
+test('Android exports survive chooser completion, use unique paths and remove expired cache files', async (t) => {
+  const h = await harness({}, { platform: 'android' }); t.after(h.close);
+  h.exports.set('exports/old.json', { type: 'file', mtime: Date.now() - 86400001 });
+  const blob = new h.window.Blob(['backup'], { type: 'application/json' });
+  await h.window.LinguaNative.exportFile(blob, '学习记录.json');
+  await h.window.LinguaNative.exportFile(blob, '学习记录.json');
+  assert.equal(h.exports.has('exports/old.json'), false);
+  assert.equal(h.exports.size, 2);
+  for (const share of h.shares) assert.ok(h.exports.has(share.files[0].slice('file:///'.length)));
+});
+
+test('iOS exports are removed after the sharing activity completes', async (t) => {
+  const h = await harness(); t.after(h.close);
+  await h.window.LinguaNative.exportFile(new h.window.Blob(['backup']), 'backup.json');
+  assert.equal(h.shares.length, 1); assert.equal(h.exports.size, 0);
+});

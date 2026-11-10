@@ -1,0 +1,284 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { CHECK_TIMEOUT_MS, NATIVE_REVISION, NativeUpdateRequiredError, UpdateManager, validateManifest, validateNativeBuild } from '../mobile/src/update.js';
+import { normalizeTarget } from '../mobile/src/channels.js';
+import { apiUrl } from '../web/js/api.js';
+import { config } from '../web/js/config.js';
+
+const version = 'a'.repeat(64), checksum = 'b'.repeat(64);
+const manifest = { schema: 1, appId: 'app.linguatrack.mobile', nativeRevision: NATIVE_REVISION, version,
+  minimumNativeBuilds: { android: 10, ios: 13 },
+  bundle: `bundle-${version}.zip`, checksum, size: 100 };
+function fixture(overrides = {}) {
+  const calls = [], saved = [];
+  const updater = {
+    list: async () => ({ bundles: [] }),
+    download: async (options) => { calls.push(options); return { id: 'local-id', version, checksum, status: 'pending' }; },
+    set: async ({ id }) => { calls.push(['activate', id]); },
+    ...overrides,
+  };
+  const manager = new UpdateManager({ updater, fetchManifest: async () => ({ data: manifest, manifestUrl: 'https://example.org/lingua/mobile/manifest.json' }),
+    save: async (state) => { saved.push(structuredClone(state)); }, state: { source: { channel: 'own', ownUrl: 'https://example.org/lingua/' }, pending: null },
+    currentVersion: 'c'.repeat(64), getNativeInfo: async () => ({ platform: 'ios', build: '13' }) });
+  return { manager, calls, saved, updater };
+}
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+for (const step of ['manifest', 'native info', 'bundle list']) {
+  test(`a stalled ${step} check times out, releases the lock and can be retried`, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const { manager, updater, saved } = fixture();
+    const owner = step === 'bundle list' ? updater : manager;
+    const key = step === 'manifest' ? 'fetchManifest' : step === 'native info' ? 'getNativeInfo' : 'list';
+    const original = owner[key];
+    let finish;
+    owner[key] = () => new Promise((resolve) => { finish = resolve; });
+    const task = manager.check();
+    const timedOut = assert.rejects(task, /检查更新超时/);
+    await flush();
+    t.mock.timers.tick(CHECK_TIMEOUT_MS - 1);
+    assert.equal(manager.busy, task);
+    t.mock.timers.tick(1);
+    await timedOut;
+    assert.equal(manager.busy, null);
+    assert.equal(manager.available, null);
+    assert.equal(saved.length, 0);
+    owner[key] = original;
+    const current = await manager.check();
+    finish(await original()); await flush();
+    assert.equal(manager.available, current, 'a late response cannot replace the retry result');
+    assert.equal(manager.busy, null);
+  });
+}
+
+test('cancellation immediately releases a hung check without unlocking a newer check', async () => {
+  const { manager } = fixture();
+  const original = manager.fetchManifest;
+  const finishes = [];
+  manager.fetchManifest = () => new Promise((resolve) => finishes.push(resolve));
+  const cancelled = assert.rejects(manager.check(), { name: 'AbortError' });
+  assert.equal(manager.cancelCheck(), true);
+  assert.equal(manager.busy, null);
+  const retry = manager.check();
+  await cancelled;
+  finishes[0](await original()); await flush();
+  assert.equal(manager.busy, retry);
+  assert.equal(manager.available, null);
+  finishes[1](await original());
+  assert.equal((await retry).version, version);
+  assert.equal(manager.busy, null);
+});
+
+test('a cancelled same-version response cannot clear pending state or save the old source', async () => {
+  const { manager, saved } = fixture();
+  manager.currentVersion = version;
+  manager.state.pending = { id: 'pending', version: 'd'.repeat(64), checksum };
+  const original = manager.fetchManifest;
+  let finish;
+  manager.fetchManifest = () => new Promise((resolve) => { finish = resolve; });
+  const cancelled = assert.rejects(manager.check(), { name: 'AbortError' });
+  manager.cancelCheck(); await cancelled;
+  finish(await original()); await flush();
+  assert.equal(saved.length, 0);
+  assert.equal(manager.state.pending.id, 'pending');
+});
+
+test('cancellation and the check deadline cannot release an in-flight preferences commit', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { manager } = fixture();
+  manager.currentVersion = version;
+  manager.state.pending = { id: 'obsolete' };
+  let finish;
+  manager.save = () => new Promise((resolve) => { finish = resolve; });
+  const task = manager.check(); await flush();
+  assert.equal(manager.cancelCheck(), false);
+  t.mock.timers.tick(CHECK_TIMEOUT_MS);
+  assert.equal(manager.busy, task);
+  finish(); await task;
+  assert.equal(manager.busy, null);
+  assert.equal(manager.state.pending, null);
+});
+
+test('check cancellation and timeout never unlock an actual download', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let finish;
+  const { manager } = fixture({ download: () => new Promise((resolve) => { finish = resolve; }) });
+  const task = manager.download(await manager.check()); await flush();
+  assert.equal(manager.cancelCheck(), false);
+  t.mock.timers.tick(CHECK_TIMEOUT_MS);
+  assert.equal(manager.busy, task);
+  await assert.rejects(manager.download(), /等待当前更新/);
+  finish({ id: 'downloaded', version, checksum, status: 'pending' });
+  await task;
+  assert.equal(manager.busy, null);
+});
+test('target normalization accepts a site or index and rejects unsafe transports and credentials', () => {
+  assert.equal(normalizeTarget(' https://example.org/lingua/index.html '), 'https://example.org/lingua/');
+  assert.equal(normalizeTarget('https://example.org/lingua'), 'https://example.org/lingua/');
+  for (const value of ['http://example.org', 'javascript:alert(1)', 'file:///test', 'https://user:pass@example.org',
+    'https://example.org/?secret=x', 'https://example.org/#x', '']) assert.throws(() => normalizeTarget(value));
+});
+test('manifest binds zip URL to selected site and refuses incompatible or malformed updates', () => {
+  assert.equal(validateManifest(manifest, 'https://example.org/lingua/mobile/manifest.json').url,
+    `https://example.org/lingua/mobile/bundle-${version}.zip`);
+  for (const patch of [{ appId: 'other' }, { schema: 2 }, { nativeRevision: NATIVE_REVISION - 1 }, { bundle: '../evil.zip' },
+    { bundle: 'https://other.org/a.zip' }, { checksum: '' }, { version: '../bad' }, { size: 0 }, { size: 101 * 1024 * 1024 }]) {
+    assert.throws(() => validateManifest({ ...manifest, ...patch }, 'https://example.org/'));
+  }
+});
+test('native incompatibility has a distinct action while malformed manifests remain ordinary errors', async () => {
+  const { manager, calls, saved } = fixture();
+  manager.fetchManifest = async () => ({ data: { ...manifest, nativeRevision: NATIVE_REVISION + 1 },
+    manifestUrl: 'https://example.org/mobile/manifest.json' });
+  await assert.rejects(manager.check(), (error) => {
+    assert.ok(error instanceof NativeUpdateRequiredError);
+    assert.equal(error.message, '请到仓库下载最新版应用');
+    return true;
+  });
+  assert.equal(manager.available, null);
+  assert.equal(calls.length, 0);
+  assert.equal(saved.length, 0);
+  for (const patch of [{ nativeRevision: undefined }, { nativeRevision: '4' }, { nativeRevision: 0 },
+    { schema: 2 }, { appId: 'other' }, { checksum: '' }, { bundle: '../other.zip' }]) {
+    assert.throws(() => validateManifest({ ...manifest, nativeRevision: NATIVE_REVISION + 1, ...patch },
+      'https://example.org/mobile/manifest.json'), (error) => !(error instanceof NativeUpdateRequiredError));
+  }
+});
+
+test('checks are coalesced and never download until explicitly requested', async () => {
+  const { manager, calls, saved } = fixture();
+  const a = manager.check(), b = manager.check(); assert.equal(a, b);
+  const available = await a;
+  assert.equal(calls.length, 0); assert.equal(saved.length, 0);
+  await manager.download(available);
+  assert.equal(calls.length, 1); assert.equal(saved.length, 1);
+  assert.equal(calls[0].checksum, checksum);
+  assert.equal(saved[0].pending.id, 'local-id');
+});
+
+test('native builds are checked per platform; newer shells can use older compatible bundles', () => {
+  for (const platform of ['android', 'ios']) {
+    const required = manifest.minimumNativeBuilds[platform];
+    for (const installed of [required, required + 1]) {
+      assert.doesNotThrow(() => validateNativeBuild(manifest, { platform, build: String(installed) }));
+    }
+    assert.throws(() => validateNativeBuild(manifest, { platform, build: String(required - 1) }), NativeUpdateRequiredError);
+    for (const build of [undefined, 13, '', '1.0', '13x', '0', '9007199254740992']) {
+      assert.throws(() => validateNativeBuild(manifest, { platform, build }), /无法读取应用版本/);
+    }
+  }
+  assert.throws(() => validateNativeBuild(manifest, { platform: 'web', build: '13' }), /无法读取应用版本/);
+  for (const minimumNativeBuilds of [undefined, null, {}, { ios: 13 }, { ios: 0, android: 10 }, { ios: '13', android: 10 }]) {
+    assert.throws(() => validateManifest({ ...manifest, minimumNativeBuilds }, 'https://example.org/mobile/manifest.json'), /更新清单无效/);
+  }
+});
+
+test('same frontend hash on an old binary still requires reinstall and preserves pending state', async () => {
+  const { manager, calls, saved } = fixture();
+  manager.currentVersion = version;
+  const pending = { id: 'pending', version: 'd'.repeat(64), checksum };
+  manager.state.pending = pending;
+  manager.getNativeInfo = async () => ({ platform: 'ios', build: '12' });
+  await assert.rejects(manager.check(), NativeUpdateRequiredError);
+  assert.equal(manager.available, null);
+  assert.equal(manager.state.pending, pending);
+  assert.equal(calls.length, 0); assert.equal(saved.length, 0);
+});
+
+test('unreadable binary information fails the check without offering a download', async () => {
+  const { manager, calls, saved } = fixture();
+  manager.getNativeInfo = async () => { throw Error('native bridge failed'); };
+  await assert.rejects(manager.check(), /native bridge failed/);
+  assert.equal(manager.available, null); assert.equal(manager.busy, null);
+  assert.equal(calls.length, 0); assert.equal(saved.length, 0);
+});
+
+test('activation rechecks native requirements and rejects saved legacy updates without losing them', async () => {
+  const { manager, calls, updater, saved } = fixture();
+  const pending = await manager.download(await manager.check());
+  updater.list = async () => ({ bundles: [{ ...pending, status: 'pending' }] });
+  manager.getNativeInfo = async () => ({ platform: 'ios', build: '12' });
+  await assert.rejects(manager.apply(), NativeUpdateRequiredError);
+  assert.equal(calls.length, 1); assert.equal(saved.length, 1);
+  assert.equal(manager.state.pending, pending);
+  manager.getNativeInfo = async () => ({ platform: 'ios', build: '13' });
+  delete pending.minimumNativeBuilds;
+  await assert.rejects(manager.apply(), /请重新检查更新/);
+  assert.equal(calls.length, 1); assert.equal(saved.length, 1);
+});
+test('network and checksum failures never replace a working version or saved state', async () => {
+  const { manager, calls, saved, updater } = fixture();
+  manager.fetchManifest = async () => { throw Error('offline'); };
+  await assert.rejects(manager.check(), /offline/);
+  assert.equal(saved.length, 0); assert.equal(calls.length, 0);
+  manager.fetchManifest = async () => ({ data: manifest, manifestUrl: 'https://example.org/mobile/manifest.json' });
+  updater.download = async () => ({ id: 'bad', version, checksum: '0'.repeat(64) });
+  await manager.check();
+  await assert.rejects(manager.download(), /校验/); assert.equal(saved.length, 0);
+  updater.download = async () => { throw Error('disk full'); };
+  await assert.rejects(manager.download(), /disk full/); assert.equal(saved.length, 0);
+});
+test('same frontend and failed versions are not downloaded again', async () => {
+  const { manager, calls, updater } = fixture();
+  manager.currentVersion = version; assert.equal(await manager.check(), null);
+  manager.currentVersion = 'old';
+  updater.list = async () => ({ bundles: [{ version, status: 'error' }] });
+  await assert.rejects(manager.check(), /启动失败/); assert.equal(calls.length, 0);
+});
+test('upstream rollback to the running version discards a stale pending update', async () => {
+  const { manager, saved } = fixture();
+  manager.state.pending = { id: 'obsolete', version: 'd'.repeat(64), checksum };
+  manager.currentVersion = version;
+  assert.equal(await manager.check(), null);
+  assert.equal(manager.state.pending, null);
+  assert.equal(saved[0].pending, null);
+});
+test('pending update survives restart and only explicit apply switches native bundle', async () => {
+  const { manager, calls, updater, saved } = fixture();
+  const pending = await manager.download(await manager.check());
+  updater.list = async () => ({ bundles: [{ ...pending, status: 'pending' }] });
+  const reloaded = new UpdateManager({ updater, fetchManifest: manager.fetchManifest,
+    getNativeInfo: manager.getNativeInfo,
+    save: manager.save, state: saved[0], currentVersion: 'old' });
+  assert.deepEqual(await reloaded.download(await reloaded.check()), pending); assert.equal(calls.length, 1);
+  await reloaded.apply(); assert.deepEqual(calls[1], ['activate', 'local-id']);
+  assert.equal(saved.at(-1).pending, null);
+});
+test('evicted pending bundle is downloaded again and invalid pending cannot activate', async () => {
+  const { manager, calls } = fixture();
+  await manager.download(await manager.check()); await manager.download(await manager.check()); assert.equal(calls.length, 2);
+  await assert.rejects(manager.apply(), /失效/);
+  assert.ok(calls.every((call) => !Array.isArray(call)));
+});
+test('failed preferences commit cannot schedule or activate an uncommitted update', async () => {
+  const { manager, calls } = fixture(); manager.save = async () => { throw Error('storage unavailable'); };
+  await manager.check();
+  await assert.rejects(manager.download(), /storage unavailable/);
+  assert.equal(manager.state.pending, null); assert.equal(calls.length, 1);
+});
+test('native download completed during navigation is reused even without pending preferences', async () => {
+  const { manager, calls, saved } = fixture({ list: async () => ({ bundles: [
+    { id: 'orphan', version, checksum, status: 'pending' },
+  ] }) });
+  assert.equal((await manager.download(await manager.check())).id, 'orphan');
+  assert.equal(calls.length, 0); assert.equal(saved[0].pending.id, 'orphan');
+});
+test('native default backend follows selected subpath; explicit backend still wins', (t) => {
+  const previous = config.apiBase;
+  t.after(() => { delete globalThis.window; config.apiBase = previous; });
+  globalThis.window = { LinguaNative: { target: 'https://example.org/lingua/' } };
+  config.apiBase = '';
+  assert.equal(apiUrl('/health'), 'https://example.org/lingua/api/health');
+  config.apiBase = 'https://analysis.example/api';
+  assert.equal(apiUrl('/health'), 'https://analysis.example/api/health');
+  delete globalThis.window;
+  config.apiBase = ''; assert.equal(apiUrl('/health'), '/api/health');
+});
+
+test('activation failure keeps the downloaded update available for a later retry', async () => {
+  const { manager, updater, saved } = fixture({ set: async () => { throw Error('reload failed'); } });
+  const pending = await manager.download(await manager.check());
+  updater.list = async () => ({ bundles: [{ ...pending, status: 'pending' }] });
+  await assert.rejects(manager.apply(), /reload failed/);
+  assert.deepEqual(saved.at(-1).pending, pending);
+});

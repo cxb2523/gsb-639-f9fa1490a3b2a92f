@@ -1,0 +1,437 @@
+import assert from 'node:assert/strict';
+import { beforeEach, test } from 'node:test';
+
+const KEY = 'linguatrack.settings.v1';
+const saved = new Map();
+const styles = new Map();
+globalThis.window = { matchMedia: () => ({ matches: false, addEventListener() {} }) };
+globalThis.document = {
+  documentElement: { dataset: {}, style: { setProperty: (key, value) => styles.set(key, value) } },
+  querySelector: () => null,
+};
+globalThis.localStorage = {
+  getItem: (key) => saved.get(key) ?? null,
+  setItem: (key, value) => saved.set(key, value),
+  removeItem: (key) => saved.delete(key),
+};
+const {
+  settings, initSettings, setSetting, FONT_DEFAULTS, fontSizes, setLangFontSize, resetLangFontSizes,
+  setGlobalVideo, setPronunciation, captionSize, setLangCaptionSize, resetLangCaptionSize, videoSettings,
+} = await import('../web/js/settings.js');
+const {
+  trackCfg, initTrackCfg, readTrackCfg, setTrackCfg, setTrackFontSize, resetTrackFontSizes, dropTrackCfg,
+  deferTrackFontSizes,
+  setVideoCfg,
+  resetVideoCfg,
+  setTrackPronunciation,
+} = await import('../web/js/trackcfg.js');
+const fonts = () => Object.fromEntries(Object.keys(FONT_DEFAULTS).map((key) => [key, settings[key]]));
+
+beforeEach(() => {
+  saved.clear();
+  styles.clear();
+  initSettings(() => {});
+});
+
+test('TTS calibration defaults lower, validates old/corrupt settings and stays global', () => {
+  assert.equal(settings.ttsCalibration, .5);
+  for (const invalid of [null, true, {}, [], '', 'bad']) {
+    saved.set(KEY, JSON.stringify({ ttsCalibration: invalid })); initSettings();
+    assert.equal(settings.ttsCalibration, .5);
+  }
+  setSetting('ttsCalibration', 2); assert.equal(settings.ttsCalibration, 1);
+  setSetting('ttsCalibration', 0); assert.equal(settings.ttsCalibration, .1);
+  setSetting('ttsCalibration', .357); assert.equal(settings.ttsCalibration, .36);
+  initSettings(); assert.equal(settings.ttsCalibration, .36);
+  initTrackCfg('calibration-a', 'en');
+  setTrackPronunciation({ source: 'standard', ttsCalibration: .9 });
+  assert.equal('ttsCalibration' in trackCfg.pronunciation, false);
+  const local = saved.get('linguatrack.track.calibration-a');
+  setSetting('ttsCalibration', .6);
+  initTrackCfg('calibration-b', 'ja');
+  assert.equal(settings.ttsCalibration, .6);
+  assert.equal(saved.get('linguatrack.track.calibration-a'), local);
+});
+
+test('pronunciation inherits legacy defaults, stays isolated and survives unrelated audio edits', () => {
+  setPronunciation({ source: 'standard', autoPlay: true, onlineVoices: true, voices: { en: 'uk' } });
+  saved.set('linguatrack.track.legacy', JSON.stringify({ read: 0 }));
+  const changes = [];
+  initTrackCfg('legacy', 'en', null, (...args) => changes.push(args));
+  assert.deepEqual(trackCfg.pronunciation, settings.pronunciation);
+  assert.notEqual(trackCfg.pronunciation.voices, settings.pronunciation.voices);
+  setTrackPronunciation({ autoPlay: false, volumeBalance: false, onlineVoices: false, voices: { en: 'us' } });
+  assert.deepEqual(changes.at(-1), ['pronunciation', trackCfg.pronunciation, false]);
+  setTrackCfg('pos', 0);
+  setTrackFontSize('textSize', 32);
+  setVideoCfg({ captionSize: 28 });
+  const prefs = { ...trackCfg.pronunciation };
+  initTrackCfg('second', 'en');
+  assert.deepEqual(trackCfg.pronunciation, settings.pronunciation);
+  initTrackCfg('legacy', 'en');
+  assert.deepEqual(trackCfg.pronunciation, prefs);
+  dropTrackCfg('legacy');
+  assert.deepEqual(readTrackCfg('legacy').pronunciation, settings.pronunciation);
+});
+
+test('corrupt pronunciation archives normalize safely and storage failure still permits edits', () => {
+  saved.set('linguatrack.track.corrupt', JSON.stringify({ pronunciation: {
+    source: 'bad', autoPlay: 'false', volumeBalance: null, voices: [], speechRate: 2,
+  } }));
+  initTrackCfg('corrupt', 'en');
+  assert.deepEqual(trackCfg.pronunciation, { source: 'audio', autoPlay: false, volumeBalance: true, onlineVoices: false, voices: {} });
+  const write = localStorage.setItem;
+  localStorage.setItem = () => { throw Error('storage unavailable'); };
+  try {
+    setTrackPronunciation({ source: 'standard' });
+    assert.equal(trackCfg.pronunciation.source, 'standard');
+    assert.equal(settings.pronunciation.source, 'audio');
+  } finally { localStorage.setItem = write; }
+});
+
+test('video defaults inherit per field and font/display edits do not freeze them', () => {
+  setGlobalVideo({ position: 40, captionSize: 26 });
+  initSettings();
+  initTrackCfg('inherits', 'en');
+  assert.equal(trackCfg.video.captionSize, 26);
+  setTrackFontSize('textSize', 29);
+  setTrackCfg('read', 0);
+  assert.equal(JSON.parse(saved.get('linguatrack.track.inherits')).video, undefined);
+  setVideoCfg({ width: 80 });
+  assert.deepEqual(JSON.parse(saved.get('linguatrack.track.inherits')).video, { width: 80 });
+  setGlobalVideo({ position: 60, captionSize: 30 });
+  initTrackCfg('inherits', 'en');
+  assert.equal(trackCfg.video.position, 60);
+  assert.equal(trackCfg.video.captionSize, 30);
+  assert.equal(trackCfg.video.width, 80);
+  resetVideoCfg(['width']);
+  assert.equal(trackCfg.video.width, settings.video.width);
+  saved.set('linguatrack.track.legacy', JSON.stringify({ video: { captionSize: 18, position: 20 } }));
+  assert.equal(readTrackCfg('legacy').video.captionSize, 18);
+});
+
+test('system caption sizes inherit legacy values and persist per source language with media overrides', () => {
+  saved.set(KEY, JSON.stringify({ video: { captionSize: 26, position: 60 },
+    captionSizes: { JA: 28, en: 24 } }));
+  initSettings();
+  assert.equal(captionSize('ja'), 28);
+  assert.equal(captionSize('en'), 24);
+  assert.equal(captionSize('ko'), 26);
+  const changes = [];
+  initTrackCfg('japanese', 'ja', null, (...args) => changes.push(args));
+  assert.equal(trackCfg.video.captionSize, 28);
+  setVideoCfg({ width: 80 });
+  assert.equal(trackCfg.video.captionSize, 28);
+  assert.deepEqual(JSON.parse(saved.get('linguatrack.track.japanese')).video, { width: 80 });
+  setVideoCfg({ captionSize: 32 });
+  setLangCaptionSize('ja', 30);
+  setLangCaptionSize('en', 22);
+  initSettings();
+  assert.equal(readTrackCfg('japanese', 'ja').video.captionSize, 32);
+  initTrackCfg('japanese', 'ja');
+  resetVideoCfg(['captionSize']);
+  assert.equal(trackCfg.video.captionSize, 30);
+  assert.equal(trackCfg.video.width, 80);
+  assert.equal(changes.at(-1)[0], 'video');
+  assert.equal(changes.at(-1)[2], false);
+  assert.equal(readTrackCfg('new-japanese', 'ja').video.captionSize, 30);
+  assert.equal(readTrackCfg('english', 'en').video.captionSize, 22);
+  assert.equal(readTrackCfg('korean', 'ko').video.captionSize, 26);
+  resetLangCaptionSize('ja');
+  assert.equal(captionSize('ja'), 20);
+  assert.equal(captionSize('en'), 22);
+  assert.equal(settings.video.captionSize, 26);
+  assert.equal(videoSettings('en').position, 60);
+  saved.set('linguatrack.track.legacy-caption', JSON.stringify({ video: { captionSize: 18 } }));
+  assert.equal(readTrackCfg('legacy-caption', 'ja').video.captionSize, 18);
+});
+
+test('language caption settings validate sizes and codes and work without persistent storage', () => {
+  saved.set(KEY, JSON.stringify({ captionSizes: { ja: 999, en: 13.6, ko: '28',
+    fr: null, de: {}, es: true, 'bad code': 24, it: -1 } }));
+  initSettings();
+  assert.deepEqual(settings.captionSizes, { ja: 36, en: 14, it: 12 });
+  for (const value of [NaN, Infinity, null, '28', {}, []]) setLangCaptionSize('ko', value);
+  assert.equal(captionSize('ko'), 20);
+  setLangCaptionSize('__proto__', 28);
+  const write = localStorage.setItem;
+  localStorage.setItem = () => { throw Error('storage unavailable'); };
+  try {
+    setLangCaptionSize('KO', 28.4);
+    assert.equal(captionSize('ko'), 28);
+    resetLangCaptionSize('ko');
+    assert.equal(captionSize('ko'), 20);
+  } finally { localStorage.setItem = write; }
+});
+
+test('raw subtitle edits preserve hidden learning preferences for later analysis', () => {
+  initTrackCfg('raw', 'en');
+  setTrackCfg('tr', 1);
+  initTrackCfg('raw', 'en', ['text']);
+  assert.equal(trackCfg.tr, 0);
+  setVideoCfg({ captionSize: 24 });
+  initTrackCfg('raw', 'en');
+  assert.equal(trackCfg.tr, 1);
+});
+
+test('video preferences are bounded, isolated per track and survive subtitle changes', () => {
+  initTrackCfg('video-one', 'en');
+  setVideoCfg({ position: 70, width: 80, height: 55, transparency: 40, blur: 18,
+    fit: 'cover', muted: 1 });
+  setTrackCfg('read', 1);
+  setTrackFontSize('textSize', 29);
+  assert.equal(readTrackCfg('video-one').video.position, 70);
+  initTrackCfg('video-two', 'en');
+  assert.equal(trackCfg.video.position, 0);
+  assert.equal(trackCfg.video.fit, 'contain');
+  initTrackCfg('video-one', 'en');
+  assert.equal(trackCfg.video.fit, 'cover');
+  assert.equal(trackCfg.video.transparency, 40);
+  assert.equal(trackCfg.video.blur, 18);
+  assert.equal(trackCfg.fonts.textSize, 29);
+  setVideoCfg({ position: 999, width: -1, volume: NaN });
+  assert.equal(trackCfg.video.position, 100);
+  assert.equal(trackCfg.video.width, 50);
+  assert.equal(trackCfg.video.volume, 100);
+  dropTrackCfg('video-one');
+  assert.equal(readTrackCfg('video-one').video.position, 0);
+});
+
+test('default fonts are applied as independent pixel sizes', () => {
+  assert.deepEqual(fonts(), { textSize: 25, readSize: 12, romanSize: 11.5, trSize: 16.5 });
+  assert.deepEqual(Object.fromEntries(styles), {
+    '--fs-text': '25px', '--fs-read': '12px', '--fs-roman': '11.5px', '--fs-tr': '16.5px',
+  });
+});
+
+test('legacy percentages and named sizes migrate with the original auxiliary scaling', () => {
+  for (const size of [120, 'l']) {
+    saved.set(KEY, JSON.stringify({ size, theme: 'dark', rate: 1.5, track: 'lesson' }));
+    initSettings();
+    assert.deepEqual(fonts(), { textSize: 30, readSize: 13.5, romanSize: 13, trSize: 18.5 });
+    assert.equal(settings.theme, 'dark');
+    assert.equal(settings.rate, 1.5);
+    assert.equal(settings.track, 'lesson');
+  }
+});
+
+test('saved per-layer sizes override legacy values and survive reload', () => {
+  saved.set(KEY, JSON.stringify({ size: 120, readSize: 21, trSize: 24.5 }));
+  initSettings();
+  setSetting('textSize', 32);
+  assert.deepEqual(fonts(), { textSize: 32, readSize: 21, romanSize: 13, trSize: 24.5 });
+  assert.equal(JSON.parse(saved.get(KEY)).size, undefined);
+  initSettings();
+  assert.deepEqual(fonts(), { textSize: 32, readSize: 21, romanSize: 13, trSize: 24.5 });
+});
+
+test('each font change relayouts without altering other layers; theme and rate do not', () => {
+  const changes = [];
+  initSettings((...args) => changes.push(args));
+  for (const [key, initial] of Object.entries(FONT_DEFAULTS)) {
+    const previous = fonts();
+    setSetting(key, initial + 2);
+    assert.deepEqual(fonts(), { ...previous, [key]: initial + 2 });
+    assert.deepEqual(changes.at(-1), [key, initial + 2, true]);
+  }
+  setSetting('theme', 'dark');
+  assert.deepEqual(changes.at(-1), ['theme', 'dark', false]);
+  setSetting('rate', 1.5);
+  assert.deepEqual(changes.at(-1), ['rate', 1.5, false]);
+  setSetting('rate', 1.5);
+  setSetting('size', 160);
+  assert.equal(changes.length, 6);
+});
+
+test('font input is bounded and invalid values preserve the current value', () => {
+  setSetting('readSize', '22.3');
+  assert.equal(settings.readSize, 22.5);
+  for (const value of ['', ' ', 'bad', null, undefined, NaN, Infinity, {}, [], true]) {
+    setSetting('readSize', value);
+    assert.equal(settings.readSize, 22.5);
+  }
+  setSetting('readSize', 1000);
+  assert.equal(settings.readSize, 64);
+  setSetting('readSize', -10);
+  assert.equal(settings.readSize, 8);
+  saved.set(KEY, JSON.stringify({ readSize: null, romanSize: {}, textSize: 0, trSize: 500 }));
+  initSettings();
+  assert.deepEqual(fonts(), { textSize: 8, readSize: 12, romanSize: 11.5, trSize: 64 });
+});
+
+test('corrupt or unavailable storage still allows changing fonts', (t) => {
+  for (const value of ['broken', 'null', '[]', '42']) {
+    saved.set(KEY, value);
+    initSettings();
+    assert.deepEqual(fonts(), FONT_DEFAULTS);
+  }
+  t.mock.method(localStorage, 'getItem', () => { throw new Error('Storage unavailable'); });
+  t.mock.method(localStorage, 'setItem', () => { throw new Error('Storage unavailable'); });
+  initSettings();
+  setSetting('readSize', 20);
+  assert.equal(settings.readSize, 20);
+  assert.equal(styles.get('--fs-read'), '20px');
+});
+
+test('language sizes inherit legacy settings and stay isolated across reloads', () => {
+  saved.set(KEY, JSON.stringify({ size: 'l', readSize: 21 }));
+  initSettings();
+  const legacy = fontSizes('ja');
+  setLangFontSize('ja', 'textSize', 40);
+  setLangFontSize('EN', 'romanSize', '18.3');
+  assert.deepEqual(fontSizes('ja'), { ...legacy, textSize: 40 });
+  assert.deepEqual(fontSizes('en'), { ...legacy, romanSize: 18.5 });
+  assert.deepEqual(fontSizes('fr'), legacy);
+  initSettings();
+  assert.equal(fontSizes('ja').textSize, 40);
+  assert.equal(fontSizes('en').romanSize, 18.5);
+  resetLangFontSizes('ja');
+  assert.deepEqual(fontSizes('ja'), FONT_DEFAULTS);
+  assert.equal(fontSizes('en').romanSize, 18.5);
+  assert.deepEqual(fontSizes('fr'), legacy);
+});
+
+test('audio overrides affect only that audio and preserve inheritance for untouched sizes', () => {
+  setLangFontSize('ja', 'textSize', 31);
+  setLangFontSize('en', 'textSize', 28);
+  const global = saved.get(KEY);
+  const changes = [];
+  initTrackCfg('ja-one', 'ja', null, (...args) => changes.push(args));
+  assert.equal(styles.get('--fs-text'), '31px');
+  setTrackFontSize('textSize', 44);
+  assert.deepEqual(changes.at(-1), ['textSize', 44, true]);
+  setTrackCfg('tr', 1);
+  assert.deepEqual(JSON.parse(saved.get('linguatrack.track.ja-one')).fonts, { textSize: 44 });
+  assert.equal(saved.get(KEY), global);
+  initTrackCfg('ja-two', 'ja');
+  assert.equal(styles.get('--fs-text'), '31px');
+  assert.deepEqual(trackCfg.fonts, {});
+  initTrackCfg('en-one', 'en');
+  assert.equal(styles.get('--fs-text'), '28px');
+  initSettings();
+  initTrackCfg('ja-one', 'ja');
+  assert.equal(styles.get('--fs-text'), '44px');
+  assert.equal(trackCfg.tr, 1);
+  setLangFontSize('ja', 'readSize', 19);
+  setLangFontSize('ja', 'textSize', 33);
+  assert.equal(styles.get('--fs-text'), '44px');
+  assert.equal(styles.get('--fs-read'), '19px');
+  resetTrackFontSizes();
+  assert.equal(styles.get('--fs-text'), '33px');
+  assert.equal(JSON.parse(saved.get('linguatrack.track.ja-one')).fonts, undefined);
+  assert.equal(trackCfg.tr, 1);
+  dropTrackCfg('ja-one');
+  assert.deepEqual(readTrackCfg('ja-one', 'ja').fonts, {});
+});
+
+test('theme and playback rate changes keep the active audio font overrides', () => {
+  setLangFontSize('en', 'romanSize', 17);
+  initTrackCfg('lesson', 'en');
+  setTrackFontSize('textSize', 37);
+  for (const [key, value] of [['theme', 'dark'], ['rate', 1.5], ['track', 'lesson']]) {
+    setSetting(key, value);
+    assert.equal(styles.get('--fs-text'), '37px');
+    assert.equal(styles.get('--fs-roman'), '17px');
+  }
+  setLangFontSize('ja', 'textSize', 50);
+  assert.equal(styles.get('--fs-text'), '37px');
+});
+
+test('sparse and invalid saved overrides are normalized and unsupported audio layers cannot be changed', () => {
+  saved.set(KEY, JSON.stringify({ fonts: {
+    ja: { textSize: 35, readSize: 'bad', romanSize: 100 }, en: null, fr: [],
+  } }));
+  initSettings();
+  assert.deepEqual(fontSizes('ja'), { ...FONT_DEFAULTS, textSize: 35, romanSize: 64 });
+  assert.deepEqual(fontSizes('en'), FONT_DEFAULTS);
+  assert.deepEqual(fontSizes('fr'), FONT_DEFAULTS);
+  saved.set('linguatrack.track.lesson', JSON.stringify({ fonts: { textSize: null, trSize: 23.2 } }));
+  initTrackCfg('lesson', 'ja', ['tr', 'pos']);
+  assert.deepEqual(trackCfg.fonts, { trSize: 23 });
+  assert.equal(styles.get('--fs-text'), '35px');
+  setTrackFontSize('readSize', 30);
+  setTrackFontSize('romanSize', 30);
+  setTrackFontSize('unexpected', 30);
+  for (const value of ['', 'bad', null, {}, [], Infinity]) setTrackFontSize('trSize', value);
+  assert.deepEqual(trackCfg.fonts, { trSize: 23 });
+  setTrackFontSize('textSize', 1000);
+  assert.equal(styles.get('--fs-text'), '64px');
+  setTrackFontSize('trSize', -1);
+  assert.equal(styles.get('--fs-tr'), '8px');
+});
+
+test('language and audio font edits still work when storage is unavailable', (t) => {
+  t.mock.method(localStorage, 'getItem', () => { throw new Error('Storage unavailable'); });
+  t.mock.method(localStorage, 'setItem', () => { throw new Error('Storage unavailable'); });
+  setLangFontSize('ko', 'textSize', 30);
+  initTrackCfg('lesson', 'ko');
+  assert.equal(styles.get('--fs-text'), '30px');
+  setTrackFontSize('textSize', 35);
+  assert.equal(styles.get('--fs-text'), '35px');
+  resetTrackFontSizes();
+  assert.equal(styles.get('--fs-text'), '30px');
+});
+
+test('manual font input and repeated steps save immediately and apply one layout on close', () => {
+  const changes = [];
+  initTrackCfg('lesson', 'en', null, (...args) => changes.push(args));
+  const finish = deferTrackFontSizes();
+  const original = Object.fromEntries(styles);
+  setTrackFontSize('textSize', 48);
+  for (let i = 0; i < 20; i++) setTrackFontSize('textSize', 48 + (i + 1) * 0.5);
+  for (let i = 0; i < 12; i++) setTrackFontSize('textSize', 58 - (i + 1) * 0.5);
+  setTrackFontSize('readSize', 24);
+  assert.deepEqual(fontSizes('en', trackCfg.fonts), { ...FONT_DEFAULTS, textSize: 52, readSize: 24 });
+  assert.deepEqual(JSON.parse(saved.get('linguatrack.track.lesson')).fonts, { textSize: 52, readSize: 24 });
+  assert.deepEqual(Object.fromEntries(styles), original);
+  assert.deepEqual(changes, []);
+  setSetting('theme', 'dark');
+  setSetting('rate', 1.5);
+  setTrackCfg('pos', 0);
+  assert.deepEqual(Object.fromEntries(styles), original);
+  changes.length = 0;
+  finish();
+  assert.equal(styles.get('--fs-text'), '52px');
+  assert.equal(styles.get('--fs-read'), '24px');
+  assert.deepEqual(changes, [['fonts', { textSize: 52, readSize: 24 }, true]]);
+  finish();
+  assert.equal(changes.length, 1);
+});
+
+test('resetting fonts during preview restores inheritance with one layout on close', () => {
+  setLangFontSize('ja', 'textSize', 30);
+  saved.set('linguatrack.track.lesson', JSON.stringify({ fonts: { textSize: 42 } }));
+  const changes = [];
+  initTrackCfg('lesson', 'ja', null, (...args) => changes.push(args));
+  const finish = deferTrackFontSizes();
+  setTrackFontSize('textSize', 50);
+  resetTrackFontSizes();
+  assert.deepEqual(trackCfg.fonts, {});
+  assert.equal(JSON.parse(saved.get('linguatrack.track.lesson')).fonts, undefined);
+  assert.equal(styles.get('--fs-text'), '42px');
+  assert.deepEqual(changes, []);
+  finish();
+  assert.equal(styles.get('--fs-text'), '30px');
+  assert.deepEqual(changes, [['fonts', {}, true]]);
+  setLangFontSize('ja', 'textSize', 31);
+  assert.equal(styles.get('--fs-text'), '31px');
+});
+
+test('unchanged previews and a previous audio preview do not trigger a layout', () => {
+  const changes = [];
+  initTrackCfg('lesson', 'en', null, (...args) => changes.push(args));
+  const unchanged = deferTrackFontSizes();
+  setTrackFontSize('textSize', 40);
+  resetTrackFontSizes();
+  unchanged();
+  assert.deepEqual(changes, []);
+  const previous = deferTrackFontSizes();
+  setTrackFontSize('textSize', 50);
+  initTrackCfg('next', 'ja', null, (...args) => changes.push(args));
+  previous();
+  assert.equal(styles.get('--fs-text'), '25px');
+  assert.deepEqual(changes, []);
+  setTrackFontSize('textSize', 32);
+  assert.equal(styles.get('--fs-text'), '32px');
+  assert.deepEqual(changes, [['textSize', 32, true]]);
+});
