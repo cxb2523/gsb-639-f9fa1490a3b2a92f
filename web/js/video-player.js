@@ -4,6 +4,7 @@ import { isIOS } from './util.js';
 import { setupVideoGestures } from './video-gestures.js';
 import { setupVideoPip } from './video-pip.js';
 import { setupAudioPip } from './audio-pip.js';
+import { pipView } from './pip-view.js';
 import { nativeApp } from './native.js';
 
 export function setupVideo({ app, video, media = video, engine, toggle, onLayout, overlayOpen, openSettings }) {
@@ -229,38 +230,46 @@ export function setupVideo({ app, video, media = video, engine, toggle, onLayout
   });
   //  小窗的最后一步: 视频被搬进系统窗口后, 播放页只剩一块占位提示 (点它收回画面)。
   let pip = null;
-  const audioPip = setupAudioPip({ media, engine, app, releaseLandscape,
-    beforeOpen: () => pip?.isActive() ? pip.close() : true,
-    onStateChange: () => { paintPip(); paintAudioPip(); } });
   const audioPipButton = document.getElementById('btnAudioPip');
-  if (audioPipButton) audioPipButton.hidden = !audioPip.supported();
-  const paintAudioPip = () => {
-    if (audioPipButton) audioPipButton.hidden = !audioPip.supported();
-    audioPipButton?.setAttribute('aria-busy', String(audioPip.isBusy()));
-    audioPipButton?.setAttribute('aria-pressed', String(audioPip.isActive()));
-    audioPipButton?.setAttribute('aria-label', audioPip.isActive() ? '关闭字幕画中画' : '字幕画中画');
-  };
-  audioPipButton?.addEventListener('click', () => audioPip.toggle());
-  const paintPip = () => {
-    const on = pip ? pip.isActive() : false;
+  /*  两类小窗互斥, 按钮、占位提示和 app 类名永远从同一份状态快照绘制 (pip-view.js),
+      不会画出「同时开启」的中间态; 任一小窗退出后类名也随之回到真实状态。 */
+  function paintPips() {
+    const view = pipView({
+      videoActive: pip ? pip.isActive() : false,
+      audioActive: audioPip.isActive(),
+      audioSupported: audioPip.supported(),
+      audioBusy: audioPip.isBusy(),
+    });
     for (const button of [pipBtn, pipTool]) {
       if (!button) continue;
-      button.setAttribute('aria-pressed', String(on));
-      button.setAttribute('aria-label', on ? '关闭小窗' : '小窗播放');
+      button.setAttribute('aria-pressed', String(view.video.pressed));
+      button.setAttribute('aria-label', view.video.label);
+    }
+    if (audioPipButton) {
+      audioPipButton.hidden = view.audio.hidden;
+      audioPipButton.setAttribute('aria-busy', String(view.audio.busy));
+      audioPipButton.setAttribute('aria-pressed', String(view.audio.pressed));
+      audioPipButton.setAttribute('aria-label', view.audio.label);
     }
     if (pipNote) {
-      pipNote.hidden = !app.classList.contains('is-pip') && !audioPip.isActive();
-      pipNote.textContent = audioPip.isActive() ? '退出字幕小窗' : '退出小窗播放';
+      pipNote.hidden = view.note.hidden;
+      pipNote.textContent = view.note.text;
     }
+    app.classList.toggle('is-pip', view.classes['is-pip']);
+    app.classList.toggle('is-audio-pip', view.classes['is-audio-pip']);
     syncLayout();
-  };
+  }
+  const audioPip = setupAudioPip({ media, engine, app, releaseLandscape,
+    beforeOpen: () => pip?.isActive() ? pip.close() : true,
+    onStateChange: () => paintPips() });
+  audioPipButton?.addEventListener('click', () => audioPip.toggle());
   pip = setupVideoPip({ video, stage, app, engine, releaseLandscape,
-    onLayout, onStateChange: paintPip, ownsActivity: audioPip.ownsActivity,
+    onLayout, onStateChange: () => paintPips(), ownsActivity: audioPip.ownsActivity,
     beforeOpen: () => audioPip.hasSession() ? audioPip.close() : true });
   pipBtn?.addEventListener('click', () => pip.toggle());
   pipTool?.addEventListener('click', () => pip.toggle());
   pipNote?.addEventListener('click', () => audioPip.isActive() ? audioPip.close() : pip.toggle());
-  paintPip();
+  paintPips();
   window.addEventListener('pagehide', () => { clearTimeout(chromeTimer); clearTimeout(hintTimer); });
   window.addEventListener('pagehide', releaseWakeLock);
   window.addEventListener('pageshow', () => { syncLayout(); void acquireWakeLock(); });

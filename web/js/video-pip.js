@@ -19,6 +19,7 @@
 
 import { trackCfg } from './trackcfg.js';
 import { locate, randomId, toast } from './util.js';
+import { errorMessage } from './errors.js';
 import { nativeApp } from './native.js';
 import { activityPipControls } from './media-controls.js';
 
@@ -246,7 +247,13 @@ export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onL
     // 小窗请求必须留在用户手势里, 所以先要窗口, 再退出横屏。
     const win = await documentPip().requestWindow({ width: 480, height: 270, disallowReturnToOpener: false });
     pipWin = win;
-    mountDocument(win, await pipCss());
+    try {
+      mountDocument(win, await pipCss());
+    } catch (error) {
+      // 挂载失败不能留下半开状态: 视频搬回播放页、窗口关掉、状态清零再上报。
+      unmountDocument();
+      throw error;
+    }
     app.classList.add('is-pip');
     onStateChange?.();
     await releaseLandscape?.();
@@ -312,7 +319,7 @@ export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onL
       try { await openClassic(); return; } catch (error) { failures.push(error); }
     }
     if (failures.length) console.warn('[pip] 原生小窗没有打开', failures);
-    toast(failures.length ? '无法开启画中画，请检查系统权限后重试' : '当前环境不支持画中画');
+    toast(failures.length ? errorMessage(failures[0], '无法开启画中画，请检查系统权限后重试') : '当前环境不支持画中画');
   }
 
   async function toggle() {
@@ -321,7 +328,7 @@ export function setupVideoPip({ video, stage, app, engine, releaseLandscape, onL
       else if (!beforeOpen || await beforeOpen()) await open();
     } catch (error) {
       console.warn('[pip]', error);
-      toast('画中画启动失败，请重试');
+      toast(errorMessage(error, '画中画启动失败，请重试'));
     }
     onStateChange?.();
   }
